@@ -72,7 +72,7 @@ def test_saved_result_retried_without_execution(tmp_path, monkeypatch):
 def test_rejects_task_path_injection(tmp_path, monkeypatch):
     t = task()
     t["id"] = "../../outside"
-    monkeypatch.setattr("ai_ops_agent.agent.request", lambda *args: {"protocol_version": "1.0", "task": t})
+    monkeypatch.setattr("ai_ops_agent.agent.request", lambda *args, **kwargs: {"protocol_version": "1.1", "task": t})
     with pytest.raises(ValueError):
         Worker(config(tmp_path)).once()
 

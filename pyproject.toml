@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-ops-agent"
-version = "0.1.0.dev1"
-description = "Linux execution agent for AI Ops protocol 1.0"
+version = "0.1.0.dev2"
+description = "Linux execution agent for AI Ops protocol 1.1"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -14,9 +14,13 @@ test = ["pytest>=8,<10"]
 
 [project.scripts]
 ai-ops-agent = "ai_ops_agent.agent:main"
+ai-ops-agent-install = "ai_ops_agent.service:main"
 
 [tool.setuptools.packages.find]
 include = ["ai_ops_agent*"]
+
+[tool.setuptools.package-data]
+ai_ops_agent = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

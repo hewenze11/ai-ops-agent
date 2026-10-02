@@ -11,7 +11,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
-PROTOCOL = "1.0"
+PROTOCOL = "1.1"
+AGENT_VERSION = "0.1.0.dev2"
 OUTPUT_LIMIT = 65536
 
 
@@ -49,13 +50,13 @@ def read_config(path):
     return validate_config(json.loads(path.read_text()))
 
 
-def request(config, path, body):
+def request(config, path, body, timeout=30):
     req = urllib.request.Request(config["server_url"].rstrip("/") + path,
         data=json.dumps(body).encode(), method="POST",
         headers={"Authorization": "Bearer " + config["agent_token"], "Content-Type": "application/json"})
     # Never use environment-configured proxies for a credential-bearing request.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    with opener.open(req, timeout=30) as response:
+    with opener.open(req, timeout=timeout) as response:
         raw = response.read(2_000_001)
     if len(raw) > 2_000_000:
         raise ValueError("Oversized control response")
@@ -85,7 +86,7 @@ def failure(task, code, status="failed"):
             "stdout": "", "stderr": "", "error_code": code, "output_truncated": False}
 
 
-def execute(task, allowed_users):
+def execute(task, allowed_users, cancel_event=None, output_dir=None):
     if sys.platform != "linux":
         return failure(task, "UNSUPPORTED_PLATFORM")
     import pwd
@@ -112,19 +113,44 @@ def execute(task, allowed_users):
     proc = None
     buffers = [bytearray(), bytearray()]
     truncated = [False, False]
+    cancel_event = cancel_event or threading.Event()
+    stop_drain = threading.Event()
+    from .output import Spool
+    spools = [Spool(output_dir, s) for s in ('stdout', 'stderr')] if output_dir else []
 
     def drain(stream, index):
-        while True:
-            chunk = stream.read(8192)
-            if not chunk:
-                break
-            remaining = OUTPUT_LIMIT - len(buffers[index])
-            buffers[index].extend(chunk[:max(remaining, 0)])
-            if len(chunk) > remaining:
-                truncated[index] = True
-        stream.close()
+        import select
+        try:
+            while not stop_drain.is_set():
+                if not select.select([stream], [], [], 0.2)[0]:
+                    continue
+                chunk = os.read(stream.fileno(), 8192)
+                if not chunk:
+                    return
+                remaining = OUTPUT_LIMIT - len(buffers[index])
+                buffers[index].extend(chunk[:max(remaining, 0)])
+                if len(chunk) > remaining:
+                    truncated[index] = True
+                if spools:
+                    spools[index].write(chunk)
+            truncated[index] = True
+            if spools:
+                spools[index].complete = False
+        except OSError:
+            truncated[index] = True
+            if spools:
+                spools[index].complete = False
+        finally:
+            stream.close()
+
+    def with_archives(result):
+        if spools:
+            result['output_archives'] = {name: spool.close() for name, spool in zip(('stdout', 'stderr'), spools)}
+        return result
 
     try:
+        if cancel_event.is_set():
+            return with_archives(failure(task, 'CANCELLED_BEFORE_EXECUTION', 'cancelled'))
         proc = subprocess.Popen(["/bin/sh", "-c", task["command"]], cwd=account.pw_dir if Path(account.pw_dir).is_dir() else "/",
             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True, **identity)
@@ -132,11 +158,17 @@ def execute(task, allowed_users):
                    for i, stream in enumerate((proc.stdout, proc.stderr))]
         for thread in threads:
             thread.start()
-        timed_out = False
+        timed_out, cancelled = False, False
+        deadline = time.monotonic() + timeout
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            while proc.poll() is None:
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                cancel_event.wait(0.1)
         finally:
             # Terminate remaining children in the same group, even if a shell
             # exits early. Daemonized/escaped children require future cgroups.
@@ -148,14 +180,17 @@ def execute(task, allowed_users):
         for thread in threads:
             thread.join(timeout=2)
         incomplete = any(thread.is_alive() for thread in threads)
-        return {"claim_id": task["claim_id"], "status": "failed" if timed_out or incomplete or proc.returncode != 0 else "succeeded",
+        stop_drain.set()
+        for thread in threads:
+            thread.join()
+        return with_archives({"claim_id": task["claim_id"], "status": 'cancelled' if cancelled else ("failed" if timed_out or incomplete or proc.returncode != 0 else "succeeded"),
                 "exit_code": proc.returncode,
                 "stdout": bytes(buffers[0]).decode("utf-8", "replace"),
                 "stderr": bytes(buffers[1]).decode("utf-8", "replace"),
-                "error_code": "EXECUTION_TIMEOUT" if timed_out else ("OUTPUT_STREAM_NOT_CLOSED" if incomplete else None),
-                "output_truncated": any(truncated) or incomplete}
+                "error_code": 'CANCELLED_BY_OPERATOR' if cancelled else ("EXECUTION_TIMEOUT" if timed_out else ("OUTPUT_STREAM_NOT_CLOSED" if incomplete else None)),
+                "output_truncated": any(truncated) or incomplete})
     except OSError:
-        return failure(task, "PROCESS_START_FAILED")
+        return with_archives(failure(task, "PROCESS_START_FAILED"))
 
 
 class Worker:
@@ -164,8 +199,41 @@ class Worker:
         self.journal = Path(config["journal_dir"])
         self.journal.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.prefix = "/api/v1/agents/" + config["asset_id"]
+        self.instance_id = str(uuid.uuid4())
+
+    def heartbeat(self):
+        request(self.config, self.prefix + '/heartbeat', {'instance_id': self.instance_id, 'agent_version': AGENT_VERSION, 'protocol_version': PROTOCOL}, timeout=3)
+
+    def upload_outputs(self, task, result):
+        import base64
+        import hashlib
+        from .output import CHUNK_BYTES
+        for stream, manifest in (result.get('output_archives') or {}).items():
+            if stream not in ('stdout', 'stderr'):
+                raise ValueError('Invalid output stream')
+            path = self.journal / task['id'] / stream
+            digest = hashlib.sha256()
+            size = 0
+            with path.open('rb') as f:
+                while data := f.read(CHUNK_BYTES):
+                    digest.update(data)
+                    size += len(data)
+            if manifest['sha256'] != digest.hexdigest() or manifest['size'] != size:
+                raise RuntimeError('Local output changed; command will NOT replay')
+            prefix = self.prefix + '/tasks/' + task['id'] + '/output/' + stream
+            offset = 0
+            with path.open('rb') as f:
+                while data := f.read(CHUNK_BYTES):
+                    ack = request(self.config, prefix + '/chunks', {'claim_id': task['claim_id'], 'offset': offset, 'data': base64.b64encode(data).decode()})
+                    if ack.get('accepted') is not True or ack.get('next_offset') != offset + len(data):
+                        raise RuntimeError('Output chunk not acknowledged')
+                    offset += len(data)
+            ack = request(self.config, prefix + '/finalize', {'claim_id': task['claim_id'], **manifest})
+            if ack.get('accepted') is not True:
+                raise RuntimeError('Output finalize not acknowledged')
 
     def send_result(self, task, result):
+        self.upload_outputs(task, result)
         response = request(self.config, self.prefix + "/tasks/" + task["id"] + "/result", result)
         if response.get("accepted") is not True:
             raise RuntimeError("Result not acknowledged")
@@ -185,6 +253,7 @@ class Worker:
             atomic_json(path, entry)
 
     def once(self):
+        self.heartbeat()
         self.flush_pending()
         response = request(self.config, self.prefix + "/claim", {"protocol_version": PROTOCOL})
         if response.get("protocol_version") != PROTOCOL:
@@ -205,12 +274,38 @@ class Worker:
             return False
         entry = {"phase": "started", "task": task}
         atomic_json(path, entry)
-        result = execute(task, self.config["allowed_users"])
-        entry.update(phase="result_ready", result=result)
-        atomic_json(path, entry)
-        self.send_result(task, result)
-        entry["phase"] = "acknowledged"
-        atomic_json(path, entry)
+        stop, cancelled = threading.Event(), threading.Event()
+
+        def control():
+            response = request(self.config, self.prefix + '/tasks/' + task['id'] + '/control', {'claim_id': task['claim_id']}, timeout=3)
+            if response.get('cancel_requested') is True:
+                cancelled.set()
+
+        # Check a queued cancellation before starting any native process.
+        control()
+
+        def monitor():
+            while not stop.wait(2):
+                try:
+                    self.heartbeat()
+                    control()
+                except Exception:
+                    # Disconnection is NOT evidence that execution stopped.
+                    # Local timeout still applies; journal preserves the result.
+                    pass
+
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
+        try:
+            result = execute(task, self.config['allowed_users'], cancelled, self.journal / task['id'])
+            entry.update(phase='result_ready', result=result)
+            atomic_json(path, entry)
+            self.send_result(task, result)
+            entry['phase'] = 'acknowledged'
+            atomic_json(path, entry)
+        finally:
+            stop.set()
+            thread.join(timeout=7)
         return True
 
 
