@@ -38,6 +38,22 @@ def unit_text(asset_id, user, executable, config, journal):
     return UNIT.format(asset_id=asset_id, user=user, executable=executable, config=config, journal=journal)
 
 
+def _agent_executable():
+    """Absolute path to the agent entry point for the systemd unit.
+
+    `shutil.which` misses the venv when PATH is not inherited (e.g. a bare
+    `sudo bash`); falling back to the bare interpreter would drop the entry
+    point and start `python --config ...` with no module (exit status 2).
+    Resolve the console script next to the running interpreter first, then
+    PATH, then a `-m` invocation as a last resort.
+    """
+    candidate = Path(sys.executable).with_name('ai-ops-agent')
+    if candidate.exists():
+        return str(candidate)
+    found = shutil.which('ai-ops-agent')
+    return found or (sys.executable + ' -m ai_ops_agent.agent')
+
+
 def build(args):
     if sys.platform != "linux":
         raise SystemExit('Service installation is Linux-only')
@@ -46,7 +62,7 @@ def build(args):
     config = {'allow_loopback_http': args.allow_loopback_http, 'server_url': args.server_url,
               'asset_id': args.asset_id, 'agent_token': args.token,
               'allowed_users': args.user, 'journal_dir': str(Path(args.journal_dir).resolve())}
-    return config, unit_text(args.asset_id, args.user[0], shutil.which('ai-ops-agent') or sys.executable, args.config, config['journal_dir'])
+    return config, unit_text(args.asset_id, args.user[0], _agent_executable(), args.config, config['journal_dir'])
 
 
 def main():
