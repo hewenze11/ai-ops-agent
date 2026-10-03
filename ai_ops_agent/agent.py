@@ -96,6 +96,41 @@ def failure(task, code, status="failed"):
             "stdout": "", "stderr": "", "error_code": code, "output_truncated": False}
 
 
+def _cgroup_root():
+    """Return the writable cgroup v2 root we can create task cgroups under."""
+    candidate = "/sys/fs/cgroup"
+    if os.path.ismount(candidate) and os.access(candidate, os.W_OK):
+        return candidate
+    return None
+
+
+def _cgroup_available():
+    """True when cgroup v2 is mounted and writable, and cgroup.kill exists."""
+    root = _cgroup_root()
+    if root is None:
+        return False
+    return os.path.exists(os.path.join(root, "cgroup.kill"))
+
+
+def _task_cgroup_name():
+    return "ai-ops-task-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])
+
+
+def _kill_cgroup(path):
+    """Kill every process in the cgroup (covers setsid escapes), then remove it."""
+    try:
+        with open(os.path.join(path, "cgroup.kill"), "w") as handle:
+            handle.write("1")
+    except OSError:
+        pass
+    for _ in range(50):
+        try:
+            os.rmdir(path)
+            return
+        except OSError:
+            time.sleep(0.1)
+
+
 class ControlRejected(Exception):
     """The control plane durably rejected this report, so retrying cannot help."""
 
@@ -169,9 +204,26 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
     try:
         if cancel_event.is_set():
             return with_archives(failure(task, 'CANCELLED_BEFORE_EXECUTION', 'cancelled'))
-        proc = subprocess.Popen(["/bin/sh", "-c", task["command"]], cwd=account.pw_dir if Path(account.pw_dir).is_dir() else "/",
+        workdir = account.pw_dir if Path(account.pw_dir).is_dir() else "/"
+        cgroup = None
+        if _cgroup_available():
+            cgroup = os.path.join(_cgroup_root(), _task_cgroup_name())
+            try:
+                os.mkdir(cgroup, 0o755)
+            except OSError:
+                cgroup = None
+        proc = subprocess.Popen(["/bin/sh", "-c", task["command"]], cwd=workdir,
             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True, **identity)
+        if cgroup is not None:
+            # Move the fresh process into its own cgroup; descendants inherit it.
+            # This is what lets us reclaim a child that escapes its process group.
+            try:
+                with open(os.path.join(cgroup, "cgroup.procs"), "w") as handle:
+                    handle.write(str(proc.pid))
+            except OSError:
+                _kill_cgroup(cgroup)
+                cgroup = None
         threads = [threading.Thread(target=drain, args=(stream, i), daemon=True)
                    for i, stream in enumerate((proc.stdout, proc.stderr))]
         for thread in threads:
@@ -188,8 +240,11 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
                     break
                 cancel_event.wait(0.1)
         finally:
-            # Terminate remaining children in the same group, even if a shell
-            # exits early. Daemonized/escaped children require future cgroups.
+            # Reclaim every descendant. When a task cgroup is available, kill it
+            # (covers setsid daemons); otherwise fall back to the process group,
+            # which at least covers ordinary children.
+            if cgroup is not None:
+                _kill_cgroup(cgroup)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:

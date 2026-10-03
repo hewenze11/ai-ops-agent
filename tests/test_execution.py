@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -103,6 +104,32 @@ def test_real_cancel_kills_process_group(tmp_path):
     # A killed orphan can remain a zombie until PID1 reaps it; it is not running.
     from pathlib import Path
     assert not Path(stat).exists() or Path(stat).read_text().split()[2] == 'Z'
+
+
+@linux
+def test_escaped_daemon_is_reclaimed(tmp_path):
+    # A command may deliberately escape its process group with setsid. Only
+    # cgroup-level cleanup can reclaim it; the process-group fallback cannot.
+    import pwd
+    import uuid as _uuid
+    from ai_ops_agent.agent import _cgroup_available
+    if not _cgroup_available():
+        pytest.skip("cgroup cleanup requires a writable cgroup v2")
+    user = pwd.getpwuid(os.geteuid()).pw_name
+    marker = "/tmp/ai-ops-escape-" + _uuid.uuid4().hex[:8]
+    cmd = "setsid sh -c 'echo $$ > %s; sleep 900' >/dev/null 2>&1 & echo started; sleep 5" % marker
+    result = execute(task(user=user, command=cmd, timeout_seconds=1), [user], output_dir=tmp_path)
+    assert result['error_code'] == 'EXECUTION_TIMEOUT'
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not Path(marker).exists():
+        time.sleep(0.1)
+    assert Path(marker).exists(), "escape marker was never written"
+    pid = int(Path(marker).read_text().strip())
+    time.sleep(1.5)
+    stat = "/proc/%d/stat" % pid
+    # The escaped sleep must be gone (or a reaped zombie), never still running.
+    assert not Path(stat).exists() or Path(stat).read_text().split()[2] == 'Z'
+    Path(marker).unlink(missing_ok=True)
 
 
 @linux
