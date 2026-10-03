@@ -70,4 +70,4 @@ chmod 600 /etc/ai-ops-agent/config.json
 
 常驻安装、升级与卸载使用 `ai-ops-agent-install`（生成 systemd 单元与 0600 配置，不隐式删除任何东西），步骤见主服务 `docs/operations.md`。
 
-许可证待项目所有者确定。
+许可证采用 **AGPL-3.0**（见仓库根 LICENSE）。
