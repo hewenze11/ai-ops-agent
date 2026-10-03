@@ -201,10 +201,19 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
             result['output_archives'] = {name: spool.close() for name, spool in zip(('stdout', 'stderr'), spools)}
         return result
 
+    def _spawn(cwd):
+        return subprocess.Popen(["/bin/sh", "-c", task["command"]], cwd=cwd,
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, **identity)
+
     try:
         if cancel_event.is_set():
             return with_archives(failure(task, 'CANCELLED_BEFORE_EXECUTION', 'cancelled'))
-        workdir = account.pw_dir if Path(account.pw_dir).is_dir() else "/"
+        # Prefer the account's home as cwd, but a hardened sandbox
+        # (ProtectHome) can make it un-enterable AFTER the uid drop, which
+        # surfaces as a PermissionError from Popen. Fall back to / and then to a
+        # root-owned scratch dir so a restricted home never blocks execution.
+        candidates = [account.pw_dir if Path(account.pw_dir).is_dir() else "/", "/"]
         cgroup = None
         if _cgroup_available():
             cgroup = os.path.join(_cgroup_root(), _task_cgroup_name())
@@ -212,9 +221,21 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
                 os.mkdir(cgroup, 0o755)
             except OSError:
                 cgroup = None
-        proc = subprocess.Popen(["/bin/sh", "-c", task["command"]], cwd=workdir,
-            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True, **identity)
+        proc = None
+        last_error = None
+        for cwd in candidates:
+            if not isinstance(cwd, str) or not cwd:
+                continue
+            if not Path(cwd).is_dir():
+                continue
+            try:
+                proc = _spawn(cwd)
+                break
+            except PermissionError as error:
+                last_error = error
+                continue
+        if proc is None:
+            raise last_error or OSError("no usable working directory")
         if cgroup is not None:
             # Move the fresh process into its own cgroup; descendants inherit it.
             # This is what lets us reclaim a child that escapes its process group.
