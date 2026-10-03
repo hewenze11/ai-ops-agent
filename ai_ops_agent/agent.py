@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -56,8 +57,17 @@ def request(config, path, body, timeout=30):
         headers={"Authorization": "Bearer " + config["agent_token"], "Content-Type": "application/json"})
     # Never use environment-configured proxies for a credential-bearing request.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    with opener.open(req, timeout=timeout) as response:
-        raw = response.read(2_000_001)
+    try:
+        with opener.open(req, timeout=timeout) as response:
+            raw = response.read(2_000_001)
+    except urllib.error.HTTPError as error:
+        # A conflict means the control plane already holds a different, durable
+        # outcome (for example a human resolved an unknown execution). That is a
+        # settled fact, not a transport failure: surface it so the caller can
+        # stop retrying instead of wedging the worker.
+        if error.code in (409, 410):
+            raise ControlRejected(error.code, path)
+        raise
     if len(raw) > 2_000_000:
         raise ValueError("Oversized control response")
     return json.loads(raw)
@@ -84,6 +94,14 @@ def atomic_json(path, value):
 def failure(task, code, status="failed"):
     return {"claim_id": task["claim_id"], "status": status, "exit_code": None,
             "stdout": "", "stderr": "", "error_code": code, "output_truncated": False}
+
+
+class ControlRejected(Exception):
+    """The control plane durably rejected this report, so retrying cannot help."""
+
+    def __init__(self, status, path):
+        super().__init__("control rejected %s with %s" % (path, status))
+        self.status = status
 
 
 def execute(task, allowed_users, cancel_event=None, output_dir=None):
@@ -248,7 +266,14 @@ class Worker:
                 entry["phase"] = "result_ready"
                 entry["result"] = failure(entry["task"], "AGENT_RESTART_EXECUTION_UNKNOWN", "unknown")
                 atomic_json(path, entry)
-            self.send_result(entry["task"], entry["result"])
+            try:
+                self.send_result(entry["task"], entry["result"])
+            except ControlRejected:
+                # The control plane already holds a durable outcome for this task
+                # (for example a human resolved an unknown execution). Retrying
+                # would never succeed, so settle the journal entry and move on
+                # instead of blocking every later claim on this asset.
+                pass
             entry["phase"] = "acknowledged"
             atomic_json(path, entry)
 

@@ -3,7 +3,7 @@ import os
 import sys
 import uuid
 import pytest
-from ai_ops_agent.agent import Worker, atomic_json, execute, validate_config
+from ai_ops_agent.agent import ControlRejected, Worker, atomic_json, execute, validate_config
 
 
 def config(tmp_path):
@@ -67,6 +67,27 @@ def test_saved_result_retried_without_execution(tmp_path, monkeypatch):
     monkeypatch.setattr("ai_ops_agent.agent.request", lambda config, path, body: calls.append(body) or {"accepted": True})
     Worker(config(tmp_path)).flush_pending()
     assert calls == [result]
+
+
+def test_settled_result_does_not_wedge_the_worker(tmp_path, monkeypatch):
+    # A human may resolve an unknown execution while the agent is offline. On
+    # restart the agent must not retry that now-conflicting report forever; it
+    # settles the journal entry and proceeds to claim later work.
+    t1, t2 = task(), task()
+    atomic_json(tmp_path / (t1["id"] + ".json"), {"phase": "result_ready", "task": t1,
+        "result": {"claim_id": t1["claim_id"], "status": "unknown", "exit_code": None}})
+    atomic_json(tmp_path / (t2["id"] + ".json"), {"phase": "result_ready", "task": t2,
+        "result": {"claim_id": t2["claim_id"], "status": "succeeded", "exit_code": 0}})
+
+    def fake_request(config, path, body):
+        if body.get("status") == "unknown":
+            raise ControlRejected(409, path)
+        return {"accepted": True}
+
+    monkeypatch.setattr("ai_ops_agent.agent.request", fake_request)
+    Worker(config(tmp_path)).flush_pending()
+    assert json.loads((tmp_path / (t1["id"] + ".json")).read_text())["phase"] == "acknowledged"
+    assert json.loads((tmp_path / (t2["id"] + ".json")).read_text())["phase"] == "acknowledged"
 
 
 def test_rejects_task_path_injection(tmp_path, monkeypatch):
