@@ -2,6 +2,16 @@
 
 独立 Linux 执行端，版本 `0.1.0.dev2`，支持执行协议 `1.1`（兼容 1.0 服务端）。**执行链路预览，不是生产版本。**不调用LLM、不需要模型Key、不管理聊天和记忆。
 
+## 一键安装（推荐）
+
+先用主服务的一键脚本拿到配对码，再在**要被 AI 操作的机器**上：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hewenze11/ai-ops/main/deploy/install-agent.sh | sudo bash -s -- --pairing-code 'aiops1-...'
+```
+
+脚本会建两个最小权限账号、装 venv 与 systemd 服务。细节见主服务仓库 [deploy/README.md](https://github.com/hewenze11/ai-ops/blob/main/deploy/README.md)。
+
 主服务仓库 `hewenze11/ai-ops` 中的 `docs/protocol-v11.md` 是当前协议权威来源（`protocol-v1.md` 为 1.0）。两个仓库独立构建和版本发布；当前精确匹配协议1.1，不假装兼容未知版本。
 
 ## Linux 安装
