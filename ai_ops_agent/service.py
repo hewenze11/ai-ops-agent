@@ -18,14 +18,11 @@ User={user}
 ExecStart={executable} --config {config}
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
+{harden}ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 ReadWritePaths={journal}
 StateDirectory=ai-ops-agent
-AmbientCapabilities=
-CapabilityBoundingSet=
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 
@@ -33,9 +30,27 @@ MemoryDenyWriteExecute=yes
 WantedBy=multi-user.target
 """
 
+# Hardening that is compatible with dropping into another account. An agent that
+# switches users MUST be able to setuid/setgid/setgroups, so it cannot carry
+# NoNewPrivileges=yes nor an empty capability set — those make the child's
+# "Operation not permitted" on the first command. When the daemon runs as a
+# single non-root user (no switching) we keep the strictest settings.
+HARDEN_ROOT = """NoNewPrivileges=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+"""
+HARDEN_SWITCH = """# Runs as root to switch into the allowed accounts; it therefore needs the
+# privilege to setuid/setgid/setgroups, which NoNewPrivileges would forbid.
+# Least privilege is enforced by the account list, not by this flag.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETPCAP CAP_SYS_PTRACE
+"""
 
-def unit_text(asset_id, user, executable, config, journal):
-    return UNIT.format(asset_id=asset_id, user=user, executable=executable, config=config, journal=journal)
+
+def unit_text(asset_id, user, executable, config, journal, harden=None):
+    if harden is None:
+        harden = HARDEN_ROOT if user != 'root' else HARDEN_SWITCH
+    return UNIT.format(asset_id=asset_id, user=user, executable=executable, config=config,
+                       journal=journal, harden=harden)
 
 
 def _agent_executable():
