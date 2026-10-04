@@ -28,3 +28,21 @@ def test_unit_is_systemd_parseable_shape():
     for section in ('[Unit]', '[Service]', '[Install]'):
         assert section in text
     assert text.count('ExecStart=') == 1
+
+
+def test_parse_controller_multi_form():
+    from ai_ops_agent.service import _parse_controller
+    entry = _parse_controller('team-a=https://ops-a.example.com,tok-' + 'x' * 40, False)
+    assert entry == {'name': 'team-a', 'url': 'https://ops-a.example.com',
+                     'token': 'tok-' + 'x' * 40, 'enabled': True}
+    off = _parse_controller('team-b=https://ops-b.example.com,' + 'y' * 40 + ',disabled', False)
+    assert off['enabled'] is False
+
+
+def test_parse_controller_rejects_bad_shape():
+    import pytest
+    from ai_ops_agent.service import _parse_controller
+    with pytest.raises(SystemExit):
+        _parse_controller('missing-equals-sign', False)
+    with pytest.raises(SystemExit):
+        _parse_controller('only-url=https://x.example.com', False)

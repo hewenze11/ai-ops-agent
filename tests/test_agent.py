@@ -6,10 +6,15 @@ import pytest
 from ai_ops_agent.agent import ControlRejected, Worker, atomic_json, execute, validate_config
 
 
-def config(tmp_path):
-    return {"server_url": "http://127.0.0.1:8765", "allow_loopback_http": True,
+def config(tmp_path, controllers=None):
+    base = {"allow_loopback_http": True,
             "asset_id": "test", "agent_token": "test-agent-token-not-real-1234567890",
             "allowed_users": ["nobody"], "journal_dir": str(tmp_path.resolve())}
+    if controllers is None:
+        base["server_url"] = "http://127.0.0.1:8765"
+    else:
+        base["controllers"] = controllers
+    return base
 
 
 def task(user="nobody", command="id -un", **kwargs):
@@ -22,6 +27,40 @@ def task(user="nobody", command="id -un", **kwargs):
 def test_public_plaintext_rejected(tmp_path):
     c = config(tmp_path)
     c["server_url"] = "http://example.com"
+    with pytest.raises(ValueError):
+        validate_config(c)
+
+
+def test_multi_controller_validation(tmp_path):
+    # A disabled controller is stored but never used; at least one must remain
+    # enabled so the machine can still be operated.
+    c = config(tmp_path, [
+        {"name": "a", "url": "https://a.example.com", "token": "x" * 40, "enabled": True},
+        {"name": "b", "url": "https://b.example.com", "token": "y" * 40, "enabled": False}])
+    from ai_ops_agent.agent import controllers_of
+    result = controllers_of(validate_config(c))
+    assert [x["name"] for x in result] == ["a", "b"]
+    assert result[1]["enabled"] is False
+
+
+def test_all_controllers_disabled_rejected(tmp_path):
+    c = config(tmp_path, [
+        {"name": "a", "url": "https://a.example.com", "token": "x" * 40, "enabled": False}])
+    with pytest.raises(ValueError):
+        validate_config(c)
+
+
+def test_duplicate_controller_name_rejected(tmp_path):
+    c = config(tmp_path, [
+        {"name": "a", "url": "https://a.example.com", "token": "x" * 40},
+        {"name": "a", "url": "https://b.example.com", "token": "y" * 40}])
+    with pytest.raises(ValueError):
+        validate_config(c)
+
+
+def test_controller_plaintext_rejected(tmp_path):
+    c = config(tmp_path, [
+        {"name": "a", "url": "http://example.com", "token": "x" * 40}])
     with pytest.raises(ValueError):
         validate_config(c)
 
@@ -52,7 +91,7 @@ def test_crash_recovery_reports_unknown_not_execute(tmp_path, monkeypatch):
     t = task()
     atomic_json(tmp_path / (t["id"] + ".json"), {"phase": "started", "task": t})
     calls = []
-    monkeypatch.setattr("ai_ops_agent.agent.request", lambda config, path, body: calls.append(body) or {"accepted": True})
+    monkeypatch.setattr("ai_ops_agent.agent.request", lambda config, path, body, **kw: calls.append(body) or {"accepted": True})
     monkeypatch.setattr("ai_ops_agent.agent.execute", lambda *args: pytest.fail("Must not replay crashed task"))
     Worker(c).flush_pending()
     assert calls[0]["status"] == "unknown"
@@ -64,7 +103,7 @@ def test_saved_result_retried_without_execution(tmp_path, monkeypatch):
     result = {"claim_id": t["claim_id"], "status": "succeeded", "exit_code": 0}
     atomic_json(tmp_path / (t["id"] + ".json"), {"phase": "result_ready", "task": t, "result": result})
     calls = []
-    monkeypatch.setattr("ai_ops_agent.agent.request", lambda config, path, body: calls.append(body) or {"accepted": True})
+    monkeypatch.setattr("ai_ops_agent.agent.request", lambda config, path, body, **kw: calls.append(body) or {"accepted": True})
     Worker(config(tmp_path)).flush_pending()
     assert calls == [result]
 
@@ -79,7 +118,7 @@ def test_settled_result_does_not_wedge_the_worker(tmp_path, monkeypatch):
     atomic_json(tmp_path / (t2["id"] + ".json"), {"phase": "result_ready", "task": t2,
         "result": {"claim_id": t2["claim_id"], "status": "succeeded", "exit_code": 0}})
 
-    def fake_request(config, path, body):
+    def fake_request(config, path, body, **kwargs):
         if body.get("status") == "unknown":
             raise ControlRejected(409, path)
         return {"accepted": True}

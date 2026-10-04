@@ -48,7 +48,7 @@ def test_upload_retry_no_command_replay(tmp_path, monkeypatch):
     atomic_json(journal, {'phase': 'result_ready', 'task': t, 'result': result})
     calls = []
     fail = [True]
-    def request(cfg, path, body):
+    def request(cfg, path, body, **kwargs):
         calls.append(path)
         if path.endswith('/finalize') and fail[0]:
             fail[0] = False

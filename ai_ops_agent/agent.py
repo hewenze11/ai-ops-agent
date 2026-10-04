@@ -12,8 +12,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
-PROTOCOL = "1.1"
-AGENT_VERSION = "0.1.0.dev2"
+PROTOCOL = "1.2"
+AGENT_VERSION = "0.1.0.dev3"
 OUTPUT_LIMIT = 65536
 
 
@@ -22,22 +22,69 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("Redirect rejected; credential cannot be forwarded")
 
 
+def _validate_endpoint(url_text, token, allow_loopback_http):
+    """A controller endpoint must be a bare HTTPS origin with a real token."""
+    url = urllib.parse.urlsplit(url_text)
+    if url.username or url.password or url.query or url.fragment or url.path not in ("", "/"):
+        raise ValueError("controller url must contain only scheme, host and port")
+    loopback = url.hostname in ("127.0.0.1", "localhost", "::1")
+    if not url.hostname or (url.scheme != "https" and not (url.scheme == "http" and loopback and allow_loopback_http is True)):
+        raise ValueError("HTTPS required, except explicit loopback development HTTP")
+    if len(token) < 32:
+        raise ValueError("Invalid controller token")
+
+
+def controllers_of(config):
+    """Normalize config into a list of enabled controllers.
+
+    `controllers` (multi-controller, protocol 1.2) is preferred. The legacy
+    single `server_url` / `agent_token` pair is accepted and becomes one
+    controller named "default" so older configs keep working unchanged.
+    """
+    raw = config.get("controllers")
+    if raw is None:
+        _validate_endpoint(config.get("server_url"), config.get("agent_token") or "", config.get("allow_loopback_http"))
+        return [{"name": "default", "url": config["server_url"],
+                 "token": config["agent_token"], "enabled": True}]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("controllers must be a non-empty list")
+    names, result = set(), []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each controller must be an object")
+        name = item.get("name")
+        if not isinstance(name, str) or not 1 <= len(name) <= 64:
+            raise ValueError("Invalid controller name")
+        if name in names:
+            raise ValueError("Duplicate controller name")
+        names.add(name)
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("controller enabled must be a boolean")
+        _validate_endpoint(item.get("url"), item.get("token") or "", config.get("allow_loopback_http"))
+        result.append({"name": name, "url": item["url"], "token": item["token"], "enabled": enabled})
+    if not any(c["enabled"] for c in result):
+        raise ValueError("At least one controller must be enabled")
+    return result
+
+
+def _url_of(config):
+    return config.get("url") or config["server_url"]
+
+
+def _token_of(config):
+    return config.get("token") or config["agent_token"]
+
+
 def validate_config(config):
     import re
-    url = urllib.parse.urlsplit(config["server_url"])
-    if url.username or url.password or url.query or url.fragment or url.path not in ("", "/"):
-        raise ValueError("server_url must contain only scheme, host and port")
-    loopback = url.hostname in ("127.0.0.1", "localhost", "::1")
-    if not url.hostname or (url.scheme != "https" and not (url.scheme == "http" and loopback and config.get("allow_loopback_http") is True)):
-        raise ValueError("HTTPS required, except explicit loopback development HTTP")
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", config["asset_id"]):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", config.get("asset_id", "")):
         raise ValueError("Invalid asset_id")
     if not isinstance(config.get("allowed_users"), list) or not config["allowed_users"]:
         raise ValueError("Local allowed_users must not be empty")
-    if len(config.get("agent_token", "")) < 32:
-        raise ValueError("Invalid agent token")
     if not Path(config["journal_dir"]).is_absolute():
         raise ValueError("journal_dir must be absolute")
+    controllers_of(config)
     return config
 
 
@@ -52,9 +99,15 @@ def read_config(path):
 
 
 def request(config, path, body, timeout=30):
-    req = urllib.request.Request(config["server_url"].rstrip("/") + path,
+    """POST to a controller endpoint.
+
+    `config` here is a single controller view carrying `url` and `token`
+    (see Worker.controllers). Kept name `config` for backward compatibility
+    with tests that monkeypatch this function with a 3-arg signature.
+    """
+    req = urllib.request.Request(_url_of(config).rstrip("/") + path,
         data=json.dumps(body).encode(), method="POST",
-        headers={"Authorization": "Bearer " + config["agent_token"], "Content-Type": "application/json"})
+        headers={"Authorization": "Bearer " + _token_of(config), "Content-Type": "application/json"})
     # Never use environment-configured proxies for a credential-bearing request.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
@@ -289,16 +342,37 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
 
 class Worker:
     def __init__(self, config):
-        self.config = validate_config(config)
+        config = validate_config(config)
+        self.config = config
+        self.asset_id = config["asset_id"]
+        self.allowed_users = config["allowed_users"]
         self.journal = Path(config["journal_dir"])
         self.journal.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.prefix = "/api/v1/agents/" + config["asset_id"]
+        self.prefix = "/api/v1/agents/" + self.asset_id
         self.instance_id = str(uuid.uuid4())
+        self.controllers = controllers_of(config)
+        # Execution-level mutex shared across ALL controllers: at any moment this
+        # agent runs at most one command, so it reports one busy owner.
+        self.busy_by = None
+        self.busy_task = None
 
-    def heartbeat(self):
-        request(self.config, self.prefix + '/heartbeat', {'instance_id': self.instance_id, 'agent_version': AGENT_VERSION, 'protocol_version': PROTOCOL}, timeout=3)
+    def _default_controller(self):
+        for controller in self.controllers:
+            if controller["enabled"] is True:
+                return controller
+        return self.controllers[0]
 
-    def upload_outputs(self, task, result):
+    def heartbeat(self, controller=None):
+        if controller is None:
+            controller = self._default_controller()
+        body = {'instance_id': self.instance_id, 'agent_version': AGENT_VERSION,
+                'protocol_version': PROTOCOL, 'busy': self.busy_by is not None}
+        if self.busy_by is not None:
+            body['busy_by'] = self.busy_by
+            body['busy_task'] = self.busy_task
+        request(controller, self.prefix + '/heartbeat', body, timeout=3)
+
+    def upload_outputs(self, controller, task, result):
         import base64
         import hashlib
         from .output import CHUNK_BYTES
@@ -318,24 +392,71 @@ class Worker:
             offset = 0
             with path.open('rb') as f:
                 while data := f.read(CHUNK_BYTES):
-                    ack = request(self.config, prefix + '/chunks', {'claim_id': task['claim_id'], 'offset': offset, 'data': base64.b64encode(data).decode()})
+                    ack = request(controller, prefix + '/chunks', {'claim_id': task['claim_id'], 'offset': offset, 'data': base64.b64encode(data).decode()})
                     if ack.get('accepted') is not True or ack.get('next_offset') != offset + len(data):
                         raise RuntimeError('Output chunk not acknowledged')
                     offset += len(data)
-            ack = request(self.config, prefix + '/finalize', {'claim_id': task['claim_id'], **manifest})
+            ack = request(controller, prefix + '/finalize', {'claim_id': task['claim_id'], **manifest})
             if ack.get('accepted') is not True:
                 raise RuntimeError('Output finalize not acknowledged')
 
-    def send_result(self, task, result):
-        self.upload_outputs(task, result)
-        response = request(self.config, self.prefix + "/tasks/" + task["id"] + "/result", result)
+    def send_result(self, *args):
+        """send_result(task, result) or send_result(controller, task, result).
+
+        The 2-arg form resolves the owning controller from the journal entry (or
+        the first enabled controller when the task is not journalled), keeping
+        older callers working.
+        """
+        if len(args) == 2:
+            task, result = args
+            controller = self._controller_for_task(task)
+        elif len(args) == 3:
+            controller, task, result = args
+        else:
+            raise TypeError('send_result expects (task, result) or (controller, task, result)')
+        self.upload_outputs(controller, task, result)
+        response = request(controller, self.prefix + "/tasks/" + task["id"] + "/result", result)
         if response.get("accepted") is not True:
             raise RuntimeError("Result not acknowledged")
+
+    def _controller_for_task(self, task):
+        entry = self.journal / (str(task.get("id")) + ".json")
+        if entry.exists():
+            controller = self._controller_for_journal(entry)
+            if controller is not None:
+                return controller
+        return self._default_controller()
+
+    def _controller_for_journal(self, entry_path):
+        """Resolve the controller a journalled task belongs to, by name.
+
+        Task files record which controller delivered them, so a result is never
+        reported to the wrong control plane after a restart or config change.
+        A journal written before multi-controller support (no name) resolves to
+        the single/default controller so upgrades keep reporting old work.
+        """
+        try:
+            name = json.loads(entry_path.read_text()).get("controller")
+        except (OSError, ValueError):
+            return None
+        if name is None:
+            return self._default_controller()
+        for controller in self.controllers:
+            if controller["name"] == name:
+                return controller
+        return None
 
     def flush_pending(self):
         for path in sorted(self.journal.glob("*.json")):
             entry = json.loads(path.read_text())
             if entry["phase"] == "acknowledged":
+                continue
+            controller = self._controller_for_journal(path)
+            if controller is None:
+                # The owning controller is gone or disabled. Do NOT replay the
+                # command and do NOT report it elsewhere; keep the journal for
+                # an operator. This is the local control point for a blocked
+                # controller.
                 continue
             if entry["phase"] == "started":
                 # Crash window is deliberately UNKNOWN, never replay a command.
@@ -343,7 +464,7 @@ class Worker:
                 entry["result"] = failure(entry["task"], "AGENT_RESTART_EXECUTION_UNKNOWN", "unknown")
                 atomic_json(path, entry)
             try:
-                self.send_result(entry["task"], entry["result"])
+                self.send_result(controller, entry["task"], entry["result"])
             except ControlRejected:
                 # The control plane already holds a durable outcome for this task
                 # (for example a human resolved an unknown execution). Retrying
@@ -354,16 +475,34 @@ class Worker:
             atomic_json(path, entry)
 
     def once(self):
-        self.heartbeat()
+        """One pass over every enabled controller.
+
+        Returns True if at least one controller delivered work in this pass.
+        """
         self.flush_pending()
-        response = request(self.config, self.prefix + "/claim", {"protocol_version": PROTOCOL})
-        if response.get("protocol_version") != PROTOCOL:
+        worked = False
+        for controller in self.controllers:
+            if controller["enabled"] is not True:
+                continue
+            if self._once(controller):
+                worked = True
+                break
+        return worked
+
+    def _once(self, controller):
+        try:
+            self.heartbeat(controller)
+        except ControlRejected:
+            return False
+        response = request(controller, self.prefix + "/claim",
+                           {"protocol_version": PROTOCOL, "controller": controller["name"]})
+        if response.get("protocol_version") not in (PROTOCOL, "1.1"):
             raise RuntimeError("Incompatible protocol")
         task = response.get("task")
         if task is None:
             return False
         # UUID normalization prevents remote paths from becoming local filenames.
-        if str(uuid.UUID(task["id"])) != task["id"] or task.get("asset_id") != self.config["asset_id"]:
+        if str(uuid.UUID(task["id"])) != task["id"] or task.get("asset_id") != self.asset_id:
             raise ValueError("Invalid task identity")
         path = self.journal / (task["id"] + ".json")
         if path.exists():
@@ -371,42 +510,50 @@ class Worker:
             old = json.loads(path.read_text())
             if old["task"] != task:
                 raise RuntimeError("Task identity collision")
-            self.send_result(task, old.get("result") or failure(task, "DUPLICATE_DELIVERY_UNKNOWN", "unknown"))
+            self.send_result(controller, task, old.get("result") or failure(task, "DUPLICATE_DELIVERY_UNKNOWN", "unknown"))
             return False
-        entry = {"phase": "started", "task": task}
+        entry = {"phase": "started", "task": task, "controller": controller["name"]}
         atomic_json(path, entry)
         stop, cancelled = threading.Event(), threading.Event()
 
         def control():
-            response = request(self.config, self.prefix + '/tasks/' + task['id'] + '/control', {'claim_id': task['claim_id']}, timeout=3)
+            response = request(controller, self.prefix + '/tasks/' + task['id'] + '/control', {'claim_id': task['claim_id']}, timeout=3)
             if response.get('cancel_requested') is True:
                 cancelled.set()
 
         # Check a queued cancellation before starting any native process.
         control()
+        # Announce the busy owner BEFORE execution so every other controller
+        # sees it and queues its own work instead of racing.
+        self.busy_by, self.busy_task = controller["name"], task["id"]
 
         def monitor():
             while not stop.wait(2):
-                try:
-                    self.heartbeat()
-                    control()
-                except Exception:
-                    # Disconnection is NOT evidence that execution stopped.
-                    # Local timeout still applies; journal preserves the result.
-                    pass
+                for other in self.controllers:
+                    if other["enabled"] is not True:
+                        continue
+                    try:
+                        self.heartbeat(other)
+                        if other is controller:
+                            control()
+                    except Exception:
+                        # Disconnection is NOT evidence that execution stopped.
+                        # Local timeout still applies; journal preserves the result.
+                        pass
 
         thread = threading.Thread(target=monitor, daemon=True)
         thread.start()
         try:
-            result = execute(task, self.config['allowed_users'], cancelled, self.journal / task['id'])
+            result = execute(task, self.allowed_users, cancelled, self.journal / task['id'])
             entry.update(phase='result_ready', result=result)
             atomic_json(path, entry)
-            self.send_result(task, result)
+            self.send_result(controller, task, result)
             entry['phase'] = 'acknowledged'
             atomic_json(path, entry)
         finally:
             stop.set()
             thread.join(timeout=7)
+            self.busy_by, self.busy_task = None, None
         return True
 
 

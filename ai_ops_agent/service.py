@@ -79,19 +79,45 @@ def build(args):
     # explicit --run-as) the unit must run as root, and the 0600 config must be
     # owned by that same user or the agent refuses to read it.
     run_as = getattr(args, 'run_as', None) or (args.user[0] if len(args.user) == 1 else 'root')
-    config = {'allow_loopback_http': args.allow_loopback_http, 'server_url': args.server_url,
-              'asset_id': args.asset_id, 'agent_token': args.token,
+    config = {'allow_loopback_http': args.allow_loopback_http,
+              'asset_id': args.asset_id,
               'allowed_users': args.user, 'journal_dir': str(Path(args.journal_dir).resolve())}
+    if args.controller:
+        # Multi-controller form: repeatable --controller name=url,token[,disabled].
+        config['controllers'] = [_parse_controller(spec, args.allow_loopback_http) for spec in args.controller]
+    else:
+        config['server_url'] = args.server_url
+        config['agent_token'] = args.token
     return config, unit_text(args.asset_id, run_as, _agent_executable(), args.config, config['journal_dir']), run_as
+
+
+def _parse_controller(spec, allow_loopback_http):
+    """Parse `name=url,token[,disabled]` into a controller entry.
+
+    `disabled` marks a controller the local machine refuses to serve — the
+    execution-side block switch. It is stored but skipped by the agent.
+    """
+    if '=' not in spec:
+        raise SystemExit('--controller must look like name=url,token[,disabled]')
+    name, rest = spec.split('=', 1)
+    parts = rest.split(',')
+    if len(parts) < 2 or len(parts) > 3:
+        raise SystemExit('--controller must look like name=url,token[,disabled]')
+    url, token = parts[0], parts[1]
+    disabled = len(parts) == 3 and parts[2].strip().lower() in ('disabled', 'false', 'off')
+    if len(parts) == 3 and not disabled and parts[2].strip().lower() not in ('enabled', 'true', 'on'):
+        raise SystemExit('--controller third field must be enabled or disabled')
+    return {'name': name, 'url': url, 'token': token, 'enabled': not disabled}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='/etc/ai-ops-agent/config.json')
     parser.add_argument('--unit', default='/etc/systemd/system/ai-ops-agent.service')
-    parser.add_argument('--server-url', required=True)
+    parser.add_argument('--server-url', default='', help='single-controller form: controller base URL')
     parser.add_argument('--asset-id', required=True)
-    parser.add_argument('--token', required=True)
+    parser.add_argument('--token', default='', help='single-controller form: agent token')
+    parser.add_argument('--controller', action='append', default=[], help='multi-controller form: name=url,token[,disabled]; repeatable')
     parser.add_argument('--user', action='append', required=True, help='native allowed execution account; repeatable')
     parser.add_argument('--run-as', default='', help='account the agent daemon runs as (default: the only --user, else root)')
     parser.add_argument('--journal-dir', default='/var/lib/ai-ops-agent')
@@ -99,9 +125,11 @@ def main():
     parser.add_argument('--print-only', action='store_true')
     parser.add_argument('--no-start', action='store_true')
     args = parser.parse_args()
+    if not args.controller and not (args.server_url and args.token):
+        raise SystemExit('Provide either --server-url and --token, or one or more --controller')
     config, unit, run_as = build(args)
     if args.print_only:
-        print(json.dumps(config, indent=2, ensure_ascii=False).replace(config['agent_token'], '[token omitted from print]'))
+        print(json.dumps(config, indent=2, ensure_ascii=False).replace(args.token or '\u0000never', '[token omitted from print]'))
         print(unit)
         return
     path = Path(args.config)
