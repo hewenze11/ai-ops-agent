@@ -6,5 +6,9 @@ __pycache__/
 dist/
 build/
 journal/
+work/
+.env
+.env.*
+!.env.example
 config.json
 *.log

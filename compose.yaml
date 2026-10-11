@@ -1,0 +1,37 @@
+services:
+  agent:
+    image: ${AI_OPS_AGENT_IMAGE:-ghcr.io/hewenze11/ai-ops-agent:latest}
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    init: true
+    # Linux only. Enables explicit loopback HTTP / a host SSH tunnel.
+    # Host networking does NOT grant access to host files, users or processes.
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /etc/ai-ops-agent/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./journal
+        target: /var/lib/ai-ops-agent
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./work
+        target: /home/aiops
+        bind:
+          create_host_path: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

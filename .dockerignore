@@ -5,6 +5,13 @@
 .pytest_cache
 .venv
 journal
+work
+secrets
+.env
+.env.*
+*.key
+*.pem
+*.secret
 config.json
 *.log
 dist

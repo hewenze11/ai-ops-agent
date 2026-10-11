@@ -351,6 +351,9 @@ class Worker:
         self.prefix = "/api/v1/agents/" + self.asset_id
         self.instance_id = str(uuid.uuid4())
         self.controllers = controllers_of(config)
+        # Short bookkeeping lock only: a slow controller never blocks another.
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_state = {c['name']: {'seq': 0, 'results': {}, 'telemetry': True} for c in self.controllers}
         # Execution-level mutex shared across ALL controllers: at any moment this
         # agent runs at most one command, so it reports one busy owner.
         self.busy_by = None
@@ -370,7 +373,48 @@ class Worker:
         if self.busy_by is not None:
             body['busy_by'] = self.busy_by
             body['busy_task'] = self.busy_task
-        request(controller, self.prefix + '/heartbeat', body, timeout=3)
+        name = controller['name']
+        with self._heartbeat_lock:
+            state = self._heartbeat_state[name]
+            if state['seq'] >= 9007199254740991:
+                raise RuntimeError('Heartbeat sequence exhausted; restart Agent')
+            state['seq'] += 1  # Reserve before I/O, including all failed sends.
+            seq = state['seq']
+            if state['telemetry']:
+                body['heartbeat_telemetry'] = {
+                    'session_id': self.instance_id, 'controller': name, 'attempt_seq': seq,
+                    'previous_results': [{'attempt_seq': n, 'outcome': outcome}
+                        for n, outcome in sorted(state['results'].items()) if seq-10 <= n < seq]}
+        outcome = 'unconfirmed'
+        try:
+            response = request(controller, self.prefix + '/heartbeat', body, timeout=3)
+            if isinstance(response, dict) and response.get('accepted') is True:
+                outcome = 'acknowledged'
+            return response
+        except urllib.error.HTTPError as error:
+            # Old strict 1.2 services reject only the new optional field. Never
+            # downgrade on auth failures, timeouts, or invalid nested telemetry.
+            unsupported = False
+            if error.code == 422 and 'heartbeat_telemetry' in body:
+                try:
+                    detail = json.loads(error.read(8193)).get('detail', [])
+                    unsupported = isinstance(detail, list) and len(detail) == 1 and detail[0].get('type') == 'extra_forbidden' and detail[0].get('loc') == ['body', 'heartbeat_telemetry']
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            if not unsupported:
+                raise
+            with self._heartbeat_lock:
+                state['telemetry'] = False
+            # A real second HTTP attempt: reserve another sequence, no hidden
+            # retry masquerading as the failed first attempt's ACK.
+            return self.heartbeat(controller)
+        finally:
+            with self._heartbeat_lock:
+                # Late completion cannot re-grow the bounded sender window.
+                floor = state['seq'] - 9
+                if seq >= floor:
+                    state['results'][seq] = outcome
+                state['results'] = {n: r for n, r in state['results'].items() if n >= floor}
 
     def upload_outputs(self, controller, task, result):
         import base64

@@ -1,0 +1,14 @@
+{
+  "asset_id": "REPLACE_WITH_ASSET_ID_FROM_CONSOLE",
+  "controllers": [
+    {
+      "name": "main",
+      "url": "https://control.example.com",
+      "token": "REPLACE_WITH_ASSET_TOKEN_FROM_CONSOLE",
+      "enabled": true
+    }
+  ],
+  "allowed_users": ["aiops"],
+  "journal_dir": "/var/lib/ai-ops-agent",
+  "allow_loopback_http": false
+}
