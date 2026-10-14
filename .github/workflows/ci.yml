@@ -68,11 +68,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: agent-python-3.12
           path: dist
-      - name: Attach Python distribution to release
+      - name: Include one-line installer in release
+        run: |
+          cp deploy/install.sh dist/install.sh
+          sha256sum dist/install.sh > dist/install.sh.sha256
+      - name: Attach Python distribution and installer to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
