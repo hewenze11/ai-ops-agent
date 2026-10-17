@@ -1,5 +1,5 @@
 # Clean Linux runtime. Executes inside THIS container, not on the Docker host.
-FROM python:3.12-slim AS build
+FROM python:3.14-slim AS build
 WORKDIR /src
 COPY pyproject.toml LICENSE ./
 COPY ai_ops_agent ./ai_ops_agent
@@ -9,7 +9,7 @@ FROM build AS test
 COPY tests ./tests
 RUN pip install --no-cache-dir '.[test]' && pytest -q
 
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/hewenze11/ai-ops-agent"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN groupadd --gid 10001 aiops \
