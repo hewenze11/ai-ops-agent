@@ -109,6 +109,26 @@ def validate(task):
     return program, list(args)
 
 
+_VALUE_GROUP = re.compile(r'(?:[=:]\s*)(["\']?)([^\s,;"\'#]{4,})\1')
+
+
+def _discovered_values(text):
+    """Pull the actual secret value out of a matched line.
+
+    The store keys on the value, so the value is what we need — but only ever
+    the part after the ``=``/``:``, never the whole line (which would store the
+    variable name as part of the secret, and then fail to match it later).
+    """
+    found = []
+    for pattern, _replacement in _SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            inner = _VALUE_GROUP.search(match.group(0))
+            value = inner.group(2) if inner else match.group(0)
+            if 4 <= len(value) <= 4096:
+                found.append(value)
+    return found
+
+
 _SECRET_PATTERNS = [
     (re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----', re.S), MASK),
     (re.compile(r'(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[A-Za-z0-9._~+/=-]{8,}'), r'\1' + MASK),
@@ -176,6 +196,20 @@ def execute(task, allowed_users, cancel_event=None, credentials=None):
     out = proc.stdout[:limit].decode('utf-8', 'replace')
     err = proc.stderr[:limit].decode('utf-8', 'replace')
     truncated = len(proc.stdout) > limit or len(proc.stderr) > limit
+    # Discovery happens BEFORE masking, because masking destroys the value
+    # (§42). The source comes from the task's own argv, so the handle records
+    # the file that was actually read, not one the model named.
+    discovered = []
+    if credentials is not None:
+        try:
+            source = next((a for a in argv if a.startswith('/')), '')
+            for value in _discovered_values(out) + _discovered_values(err):
+                handle = credentials.register(value, source=source)
+                if handle not in discovered:
+                    discovered.append(handle)
+        except Exception:
+            # Discovery is an inventory feature; it must never break a read.
+            discovered = []
     # Exact-match masking of known credential values first (§42.1 item 2): a
     # pattern can miss a value that is shaped like nothing in particular, but a
     # value we already hold cannot be missed. The literals never leave this host
@@ -187,7 +221,10 @@ def execute(task, allowed_users, cancel_event=None, credentials=None):
             # Readonly output is masked at the source: it is a whole file body.
             'stdout': redact(out, literals), 'stderr': redact(err, literals),
             'error_code': None if proc.returncode == 0 else 'READONLY_EXIT_' + str(proc.returncode),
-            'output_truncated': truncated}
+            'output_truncated': truncated,
+            # Handles only. The model sees ``cred-xxxx`` and a name; it never
+            # sees the value, which is what makes this channel safe.
+            'credentials': discovered}
 
 
 def _failed(claim_id, code, status='failed'):
