@@ -17,7 +17,7 @@ AGENT_VERSION = "0.1.0.dev4"
 OUTPUT_LIMIT = 65536
 # Task kinds this build understands. A task with any other kind is refused
 # rather than being run down a guessed path (fail closed, docs/protocol-v13.md).
-KINDS = ("shell", "readonly")
+KINDS = ("shell", "readonly", "change")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -210,6 +210,9 @@ def dispatch(task, allowed_users, cancel_event=None, output_dir=None):
     if kind == "readonly":
         from . import readonly
         return readonly.execute(task, allowed_users, cancel_event)
+    if kind == "change":
+        from . import changes
+        return changes.execute(task, allowed_users, cancel_event, output_dir)
     return failure(task, "UNSUPPORTED_KIND:" + str(kind)[:40])
 
 
