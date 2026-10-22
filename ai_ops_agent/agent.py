@@ -12,9 +12,12 @@ import urllib.parse
 import urllib.request
 import uuid
 
-PROTOCOL = "1.2"
-AGENT_VERSION = "0.1.0.dev3"
+PROTOCOL = "1.3"
+AGENT_VERSION = "0.1.0.dev4"
 OUTPUT_LIMIT = 65536
+# Task kinds this build understands. A task with any other kind is refused
+# rather than being run down a guessed path (fail closed, docs/protocol-v13.md).
+KINDS = ("shell", "readonly")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -190,6 +193,24 @@ class ControlRejected(Exception):
     def __init__(self, status, path):
         super().__init__("control rejected %s with %s" % (path, status))
         self.status = status
+
+
+def dispatch(task, allowed_users, cancel_event=None, output_dir=None):
+    """Route a claimed task to the right executor by its ``kind``.
+
+    - missing kind   -> "shell": tasks from a pre-1.3 control plane.
+    - "readonly"     -> stdlib-only execve path, no shell, redacted output.
+    - anything else  -> refused. Never fall back to shell: that would turn an
+                        unknown future task type (e.g. a structured change set)
+                        into an unvalidated arbitrary command.
+    """
+    kind = task.get("kind", "shell")
+    if kind == "shell":
+        return execute(task, allowed_users, cancel_event, output_dir)
+    if kind == "readonly":
+        from . import readonly
+        return readonly.execute(task, allowed_users, cancel_event)
+    return failure(task, "UNSUPPORTED_KIND:" + str(kind)[:40])
 
 
 def execute(task, allowed_users, cancel_event=None, output_dir=None):
@@ -540,7 +561,7 @@ class Worker:
             return False
         response = request(controller, self.prefix + "/claim",
                            {"protocol_version": PROTOCOL, "controller": controller["name"]})
-        if response.get("protocol_version") not in (PROTOCOL, "1.1"):
+        if response.get("protocol_version") not in (PROTOCOL, "1.1", "1.2"):
             raise RuntimeError("Incompatible protocol")
         task = response.get("task")
         if task is None:
@@ -588,7 +609,7 @@ class Worker:
         thread = threading.Thread(target=monitor, daemon=True)
         thread.start()
         try:
-            result = execute(task, self.allowed_users, cancelled, self.journal / task['id'])
+            result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'])
             entry.update(phase='result_ready', result=result)
             atomic_json(path, entry)
             self.send_result(controller, task, result)
