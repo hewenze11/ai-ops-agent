@@ -9,6 +9,7 @@
     }
   ],
   "allowed_users": ["aiops"],
+  "allow_root_readonly": false,
   "journal_dir": "/var/lib/ai-ops-agent",
   "allow_loopback_http": false
 }

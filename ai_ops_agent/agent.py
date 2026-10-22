@@ -92,6 +92,12 @@ def validate_config(config):
         raise ValueError("Invalid asset_id")
     if not isinstance(config.get("allowed_users"), list) or not config["allowed_users"]:
         raise ValueError("Local allowed_users must not be empty")
+    if not isinstance(config.get("allow_root_readonly", False), bool):
+        raise ValueError("allow_root_readonly must be true or false")
+    if config.get("allow_root_readonly") is True:
+        import pwd as _pwd
+        if not any(_pwd.getpwnam(u).pw_uid == 0 for u in config["allowed_users"] if u):
+            raise ValueError("allow_root_readonly is set but no allowed account is root")
     if not Path(config["journal_dir"]).is_absolute():
         raise ValueError("journal_dir must be absolute")
     controllers_of(config)
@@ -202,7 +208,8 @@ class ControlRejected(Exception):
         self.status = status
 
 
-def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credentials=None, controller=None):
+def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credentials=None, controller=None,
+             allow_root_readonly=False):
     """Route a claimed task to the right executor by its ``kind``.
 
     - missing kind   -> "shell": tasks from a pre-1.3 control plane.
@@ -220,7 +227,8 @@ def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credential
         return execute(task, allowed_users, cancel_event, output_dir)
     if kind == "readonly":
         from . import readonly
-        return readonly.execute(task, allowed_users, cancel_event, credentials=credentials)
+        return readonly.execute(task, allowed_users, cancel_event, credentials=credentials,
+                               allow_root_readonly=allow_root_readonly)
     if kind == "change":
         from . import changes
         return changes.execute(task, allowed_users, cancel_event, output_dir,
@@ -382,6 +390,9 @@ class Worker:
         self.config = config
         self.asset_id = config["asset_id"]
         self.allowed_users = config["allowed_users"]
+        # Whether the read channel may run as root. Off unless the operator put
+        # a root account in allowed_users AND passed allow_root_readonly (§7).
+        self.allow_root_readonly = config.get("allow_root_readonly", False) is True
         self.journal = Path(config["journal_dir"])
         self.journal.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Credentials live next to the journal, owned by the service account,
@@ -629,7 +640,8 @@ class Worker:
         thread.start()
         try:
             result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'],
-                              credentials=self.credentials, controller=controller)
+                              credentials=self.credentials, controller=controller,
+                              allow_root_readonly=getattr(self, 'allow_root_readonly', False))
             entry.update(phase='result_ready', result=result)
             atomic_json(path, entry)
             self.send_result(controller, task, result)

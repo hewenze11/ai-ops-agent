@@ -101,3 +101,28 @@ def test_dispatch_routes_readonly_without_touching_shell(monkeypatch):
     monkeypatch.setattr(readonly, 'execute', lambda *a, **k: seen.append('readonly') or {'status': 'failed'})
     agent.dispatch({'claim_id': 'c' * 24, 'kind': 'readonly'}, ['nobody'])
     assert seen == ['readonly']
+
+
+def test_readonly_refuses_to_run_as_root_by_default(monkeypatch):
+    """§7 floor: unless allowed_users holds root AND the config opts in, a
+    readonly call for root is refused here, not upstream. A regex is not a
+    permission model."""
+    pwd = pytest.importorskip('pwd')
+    try:
+        pwd.getpwnam('root')
+    except KeyError:
+        pytest.skip('no root account on this platform')
+    task = {'claim_id': 'c' * 24, 'kind': 'readonly', 'run_as': 'root',
+            'execution_users': ['root'], 'tool': 'read_file',
+            'program': readonly.WHITELIST['read_file'], 'args': ['--', '/etc/passwd']}
+    monkeypatch.setattr(readonly.os, 'geteuid', lambda: 0)
+    result = readonly.execute(task, ['root'], allow_root_readonly=False)
+    assert result['error_code'] == 'READONLY_USER_ROOT'
+
+
+def test_dispatch_passes_the_root_flag_through(monkeypatch):
+    from ai_ops_agent import agent
+    seen = {}
+    monkeypatch.setattr(readonly, 'execute', lambda *a, **k: seen.update(k) or {'status': 'failed'})
+    agent.dispatch({'claim_id': 'c' * 24, 'kind': 'readonly'}, ['nobody'], allow_root_readonly=True)
+    assert seen['allow_root_readonly'] is True

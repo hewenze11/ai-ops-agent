@@ -79,7 +79,20 @@ def build(args):
     # explicit --run-as) the unit must run as root, and the 0600 config must be
     # owned by that same user or the agent refuses to read it.
     run_as = getattr(args, 'run_as', None) or (args.user[0] if len(args.user) == 1 else 'root')
+    warnings = []
+    if run_as == 'root':
+        import pwd as _pwd
+        root_allowed = any(_pwd.getpwnam(u).pw_uid == 0 for u in args.user if u)
+        if root_allowed and not args.allow_root_readonly:
+            # The read channel refuses root without this flag (§7), so an
+            # operator who really wants it must see why it is off.
+            warnings.append('readonly runs as root: enable allow_root_readonly in the config (0600) '
+                            'only if this machine has no least-privilege account to switch into')
+        elif not root_allowed:
+            warnings.append('allowed_users has no readonly-capable non-root account; '
+                            'readonly tasks will fail with USER_NOT_ALLOWED')
     config = {'allow_loopback_http': args.allow_loopback_http,
+              'allow_root_readonly': bool(args.allow_root_readonly),
               'asset_id': args.asset_id,
               'allowed_users': args.user, 'journal_dir': str(Path(args.journal_dir).resolve())}
     if args.controller:
@@ -88,7 +101,7 @@ def build(args):
     else:
         config['server_url'] = args.server_url
         config['agent_token'] = args.token
-    return config, unit_text(args.asset_id, run_as, _agent_executable(), args.config, config['journal_dir']), run_as
+    return config, unit_text(args.asset_id, run_as, _agent_executable(), args.config, config['journal_dir']), run_as, warnings
 
 
 def _parse_controller(spec, allow_loopback_http):
@@ -122,12 +135,16 @@ def main():
     parser.add_argument('--run-as', default='', help='account the agent daemon runs as (default: the only --user, else root)')
     parser.add_argument('--journal-dir', default='/var/lib/ai-ops-agent')
     parser.add_argument('--allow-loopback-http', action='store_true')
+    parser.add_argument('--allow-root-readonly', action='store_true',
+                        help='allow the readonly channel to run as root (no kernel-level floor)')
     parser.add_argument('--print-only', action='store_true')
     parser.add_argument('--no-start', action='store_true')
     args = parser.parse_args()
     if not args.controller and not (args.server_url and args.token):
         raise SystemExit('Provide either --server-url and --token, or one or more --controller')
-    config, unit, run_as = build(args)
+    config, unit, run_as, warnings = build(args)
+    for line in warnings:
+        print('[warn] ' + line, file=sys.stderr)
     if args.print_only:
         print(json.dumps(config, indent=2, ensure_ascii=False).replace(args.token or '\u0000never', '[token omitted from print]'))
         print(unit)
@@ -151,6 +168,7 @@ def main():
     if not args.no_start:
         subprocess.run(['systemctl', 'enable', '--now', 'ai-ops-agent'], check=True)
     print(json.dumps({'config': args.config, 'unit': args.unit, 'started': not args.no_start,
+                      'warnings': warnings,
                       'hint': 'Token stored only in the 0600 config file; it was not printed.'}))
 
 

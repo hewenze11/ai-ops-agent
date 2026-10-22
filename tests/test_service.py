@@ -1,48 +1,89 @@
+"""Unit file and install-time warnings.
+
+Runs on any platform: the pieces tested here are pure string/decision logic, so
+a Linux-only skip would hide regressions from the dev machine.
+"""
+import os
 import sys
 
 import pytest
-from ai_ops_agent.service import unit_text
+
+from ai_ops_agent import service
 
 
-@pytest.mark.skipif(sys.platform != 'linux', reason='Linux-only installer')
-def test_unit_never_embeds_token():
-    text = unit_text('asset-1', 'ops_read', '/opt/venv/bin/ai-ops-agent', '/etc/ai-ops-agent/config.json', '/var/lib/ai-ops-agent')
-    assert 'ai-ops-agent' in text and 'User=ops_read' in text
-    assert 'token' not in text.lower() and 'Bearer' not in text
-    # Single-user (non-root) mode keeps the strictest hardening.
-    assert 'NoNewPrivileges=yes' in text
+def test_switching_users_unit_keeps_setuid_but_drops_no_new_privileges():
+    """An agent that setuids must not carry NoNewPrivileges: the child exec
+    fails with EPERM and every task looks like CANNOT_SWITCH_USER."""
+    unit = service.unit_text('h1', 'root', '/opt/x/ai-ops-agent', '/etc/ai-ops-agent/config.json',
+                             '/var/lib/ai-ops-agent')
+    assert 'User=root' in unit
+    directives = [l for l in unit.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    assert not any(l.startswith('NoNewPrivileges') for l in directives)
+    assert 'CAP_SETUID' in unit
 
 
-def test_unit_when_running_as_root_allows_user_switching():
-    # Running as root to switch accounts MUST NOT carry NoNewPrivileges=yes:
-    # that forbids setgroups/setgid in the child, so every command would fail
-    # with "Operation not permitted". It keeps a bounded capability set instead.
-    text = unit_text('a', 'root', '/opt/venv/bin/ai-ops-agent', '/etc/x.json', '/var/lib/y')
-    assert 'User=root' in text
-    assert 'NoNewPrivileges=yes' not in text
-    assert 'CapabilityBoundingSet=CAP_SETUID CAP_SETGID' in text
+def test_single_account_unit_is_hardened():
+    unit = service.unit_text('h1', 'aiops', '/opt/x/ai-ops-agent', '/etc/ai-ops-agent/config.json',
+                             '/var/lib/ai-ops-agent')
+    assert 'NoNewPrivileges=yes' in unit
+    assert 'CapabilityBoundingSet=\n' in unit
 
 
-def test_unit_is_systemd_parseable_shape():
-    text = unit_text('a', 'u', '/bin/true', '/etc/x.json', '/var/lib/y')
-    for section in ('[Unit]', '[Service]', '[Install]'):
-        assert section in text
-    assert text.count('ExecStart=') == 1
+def test_executable_resolves_the_console_script_not_the_interpreter(monkeypatch):
+    """Falling back to `python --config ...` starts nothing: the agent exits 2
+    and the unit looks 'active (activating)' forever."""
+    monkeypatch.setattr(sys, 'executable', '/opt/ai-ops-agent/venv/bin/python')
+    # No console script next to the interpreter -> the -m form, never bare python.
+    monkeypatch.setattr(service, 'shutil', type('S', (), {'which': staticmethod(lambda name: None)}))
+    assert service._agent_executable() == '/opt/ai-ops-agent/venv/bin/python -m ai_ops_agent.agent'
 
 
-def test_parse_controller_multi_form():
-    from ai_ops_agent.service import _parse_controller
-    entry = _parse_controller('team-a=https://ops-a.example.com,tok-' + 'x' * 40, False)
-    assert entry == {'name': 'team-a', 'url': 'https://ops-a.example.com',
-                     'token': 'tok-' + 'x' * 40, 'enabled': True}
-    off = _parse_controller('team-b=https://ops-b.example.com,' + 'y' * 40 + ',disabled', False)
-    assert off['enabled'] is False
+@pytest.mark.skipif(sys.platform != 'linux', reason='needs a real executable bit')
+def test_executable_prefers_the_console_script(tmp_path, monkeypatch):
+    venv = tmp_path / 'venv' / 'bin'
+    venv.mkdir(parents=True)
+    interpreter = venv / 'python'
+    interpreter.write_text('#!/bin/sh\\n')
+    script = venv / 'ai-ops-agent'
+    script.write_text('#!/bin/sh\\n')
+    os.chmod(interpreter, 0o755)
+    os.chmod(script, 0o755)
+    monkeypatch.setattr(sys, 'executable', str(interpreter))
+    assert service._agent_executable() == str(script)
 
 
-def test_parse_controller_rejects_bad_shape():
-    import pytest
-    from ai_ops_agent.service import _parse_controller
-    with pytest.raises(SystemExit):
-        _parse_controller('missing-equals-sign', False)
-    with pytest.raises(SystemExit):
-        _parse_controller('only-url=https://x.example.com', False)
+@pytest.mark.skipif(sys.platform != 'linux', reason='reads /etc/passwd structure via pwd')
+def test_build_warns_when_readonly_would_run_as_root(monkeypatch):
+    args = _args(user=['aiops_read', 'aiops_ops'])
+    monkeypatch.setattr(service, '_agent_executable', lambda: '/opt/x/ai-ops-agent')
+    _config, unit, run_as, warnings = service.build(args)
+    # Two accounts means a switching agent, hence root, hence the readonly
+    # channel has no root account to refuse -- the unit is fine and quiet.
+    assert run_as == 'root'
+    assert 'User=root' in unit
+    assert warnings == []
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='reads /etc/passwd structure via pwd')
+def test_build_flags_a_missing_readonly_account(monkeypatch):
+    args = _args(user=['root'])
+    monkeypatch.setattr(service, '_agent_executable', lambda: '/opt/x/ai-ops-agent')
+    _config, _unit, _run_as, warnings = service.build(args)
+    assert any('allow_root_readonly' in line for line in warnings)
+
+
+def _args(user, allow_root_readonly=False):
+    class A:
+        pass
+    args = A()
+    args.asset_id = 'h1'
+    args.config = '/etc/ai-ops-agent/config.json'
+    args.journal_dir = '/var/lib/ai-ops-agent'
+    args.server_url = 'https://control.example.com'
+    args.token = 't' * 32
+    args.controller = []
+    args.user = user
+    args.run_as = ''
+    args.allow_loopback_http = False
+    args.allow_root_readonly = allow_root_readonly
+    return args

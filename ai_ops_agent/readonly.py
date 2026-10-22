@@ -154,7 +154,7 @@ def redact(text, literals=()):
     return text
 
 
-def execute(task, allowed_users, cancel_event=None, credentials=None):
+def execute(task, allowed_users, cancel_event=None, credentials=None, allow_root_readonly=False):
     """Run one readonly task. Returns a result dict shaped like execute()."""
     claim_id = task.get('claim_id')
     run_as = task.get('run_as')
@@ -165,6 +165,14 @@ def execute(task, allowed_users, cancel_event=None, credentials=None):
         account = pwd.getpwnam(run_as)
     except (ImportError, KeyError):
         return _failed(claim_id, 'USER_NOT_FOUND')
+    # Gate 2's kernel-level floor (§7): the read channel must not run as root.
+    # Root can read /etc/shadow and every private key, so a masking regex is the
+    # only thing standing between "read a log" and "read the host's secrets".
+    # A machine that genuinely needs root reads must say so explicitly, and it
+    # then knows it has no floor under the software layer.
+    allow_root = allow_root_readonly is True
+    if account.pw_uid == 0 and not allow_root:
+        return _failed(claim_id, 'READONLY_USER_ROOT')
     try:
         program, argv = validate(task)
     except Rejected as error:
