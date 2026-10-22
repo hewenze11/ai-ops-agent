@@ -133,7 +133,7 @@ def validate(task):
     return steps
 
 
-def execute(task, allowed_users, cancel_event=None, output_dir=None):
+def execute(task, allowed_users, cancel_event=None, output_dir=None, credentials=None, controller=None):
     claim_id = task.get('claim_id')
     run_as = task.get('run_as')
     if run_as not in (task.get('execution_users') or []) or run_as not in allowed_users:
@@ -147,6 +147,18 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
         steps = validate(task)
     except Rejected as error:
         return _failed(claim_id, 'ACTION_REJECTED:' + error.code)
+    # Credential injection (§42.1 item 1): only the parameters this action table
+    # declares as sinks get a value, and only if the local store agrees this
+    # controller may see it. Everything else stays a literal placeholder, so a
+    # prompt that puts cred:xxx somewhere clever injects nothing.
+    literals = []
+    if credentials is not None:
+        controller_id = _controller_id(controller)
+        try:
+            steps = [dict(step, params=_inject(step, credentials, controller_id)) for step in steps]
+        except CredentialError as error:
+            return _failed(claim_id, 'ACTION_REJECTED:' + error.code)
+        literals = list(credentials.literals())
     timeout = task.get('timeout_seconds', 120)
     if type(timeout) is not int or not 1 <= timeout <= 3600:
         return _failed(claim_id, 'INVALID_TIMEOUT')
@@ -173,6 +185,9 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
         except OSError as error:
             report = {'status': 'failed', 'exit_code': None,
                       'output': 'exec failed: ' + type(error).__name__, 'error_code': 'ACTION_EXEC_FAILED'}
+        except Rejected as error:
+            report = {'status': 'failed', 'exit_code': None,
+                      'output': '', 'error_code': error.code}
         report.update({'step': index, 'action': step['action']})
         reports.append(report)
         if report['status'] != 'succeeded':
@@ -181,7 +196,7 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
     overall = 'succeeded' if failed_at is None else (
         'cancelled' if reports[failed_at - 1]['status'] == 'cancelled' else 'failed')
     body = '\n'.join('[%d] %s %s: %s' % (r['step'], r['action'], r['status'],
-                                         (r.get('output') or '').strip()[:2000])
+                                         _mask((r.get('output') or '').strip()[:2000], literals))
                      for r in reports)
     return {'claim_id': claim_id, 'status': overall,
             'exit_code': 0 if overall == 'succeeded' else (reports[-1].get('exit_code') or 1),
@@ -196,6 +211,12 @@ def execute(task, allowed_users, cancel_event=None, output_dir=None):
 
 def _run_step(step, env, identity, timeout, output_dir, cancel_event):
     action, params = step['action'], step['params']
+    # Re-check the injected value: injection puts plaintext into params, so the
+    # argv rebuilt for the wire must be rebuilt from the same params, not from
+    # whatever the control plane claimed.
+    rebuilt = BUILDERS.get(action)
+    if rebuilt is not None:
+        step = dict(step, args=rebuilt[1](params))
     if action == 'file.write':
         return _write(params['path'], params['content'])
     if action == 'file.append':
@@ -240,6 +261,51 @@ def _append(path, line):
     with open(path, 'a', encoding='utf-8') as handle:
         handle.write(line if line.endswith('\n') else line + '\n')
     return {'status': 'succeeded', 'exit_code': 0, 'output': 'appended to ' + path}
+
+
+def _mask(text, literals):
+    """Exact-match mask of every credential value this host holds.
+
+    Runs over the receipt because a legitimatised command prints its own
+    arguments (``kubectl`` echoes the deployment, a failing daemon prints the
+    connection string it was given), and the receipt is model-visible (§42.1).
+    """
+    if not text or not literals:
+        return text
+    for literal in literals:
+        if literal and len(literal) >= 4:
+            text = text.replace(literal, '[REDACTED]')
+    return text
+
+
+def _controller_id(controller):
+    """Stable identity of the asking control plane.
+
+    The config may name it explicitly; otherwise the URL origin is the identity,
+    because that is what the operator configured and what the agent contacted.
+    """
+    if not isinstance(controller, dict):
+        return ''
+    if controller.get('controller_id'):
+        return controller['controller_id']
+    import urllib.parse
+    parts = urllib.parse.urlsplit(controller.get('url') or '')
+    return (parts.scheme + '://' + parts.netloc) if parts.netloc else ''
+
+
+def _inject(step, store, controller_id):
+    """Replace ``cred:<id>`` in declared sink parameters only."""
+    from .credentials import CredentialError, SINKS
+    params = dict(step['params'])
+    for key, value in params.items():
+        if isinstance(value, str) and value.startswith('cred:'):
+            credential_id = value[5:]
+            if key not in SINKS:
+                raise CredentialError('CREDENTIAL_SINK_NOT_DECLARED')
+            if not store.may_share(controller_id, credential_id):
+                raise CredentialError('CREDENTIAL_NOT_SHARED')
+            params[key] = store.reveal(credential_id)
+    return params
 
 
 def _failed(claim_id, code):

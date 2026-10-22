@@ -48,7 +48,9 @@ def controllers_of(config):
     if raw is None:
         _validate_endpoint(config.get("server_url"), config.get("agent_token") or "", config.get("allow_loopback_http"))
         return [{"name": "default", "url": config["server_url"],
-                 "token": config["agent_token"], "enabled": True}]
+                 "token": config["agent_token"], "enabled": True,
+                 "trust": 'own' if config.get('own') is True else 'cooperative',
+                 "controller_id": config.get('controller_id') if isinstance(config.get('controller_id'), str) else None}]
     if not isinstance(raw, list) or not raw:
         raise ValueError("controllers must be a non-empty list")
     names, result = set(), []
@@ -65,7 +67,12 @@ def controllers_of(config):
         if not isinstance(enabled, bool):
             raise ValueError("controller enabled must be a boolean")
         _validate_endpoint(item.get("url"), item.get("token") or "", config.get("allow_loopback_http"))
-        result.append({"name": name, "url": item["url"], "token": item["token"], "enabled": enabled})
+        result.append({"name": name, "url": item["url"], "token": item["token"], "enabled": enabled,
+                       # own/cooperative is a property of THIS pairing (§47.2),
+                       # not of the agent: the same host may be owned by one
+                       # control plane and merely cooperate with another.
+                       "trust": 'own' if item.get('own') is True else 'cooperative',
+                       "controller_id": item.get('controller_id') if isinstance(item.get('controller_id'), str) else None})
     if not any(c["enabled"] for c in result):
         raise ValueError("At least one controller must be enabled")
     return result
@@ -195,24 +202,29 @@ class ControlRejected(Exception):
         self.status = status
 
 
-def dispatch(task, allowed_users, cancel_event=None, output_dir=None):
+def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credentials=None, controller=None):
     """Route a claimed task to the right executor by its ``kind``.
 
     - missing kind   -> "shell": tasks from a pre-1.3 control plane.
     - "readonly"     -> stdlib-only execve path, no shell, redacted output.
+    - "change"       -> structured action set, argv rebuilt locally.
     - anything else  -> refused. Never fall back to shell: that would turn an
-                        unknown future task type (e.g. a structured change set)
-                        into an unvalidated arbitrary command.
+                        unknown future task type into an unvalidated command.
+
+    ``credentials`` is the local store; ``controller`` says which control plane
+    asked, because whether plaintext may leave this host is a property of that
+    pairing, not of the task (§47.2).
     """
     kind = task.get("kind", "shell")
     if kind == "shell":
         return execute(task, allowed_users, cancel_event, output_dir)
     if kind == "readonly":
         from . import readonly
-        return readonly.execute(task, allowed_users, cancel_event)
+        return readonly.execute(task, allowed_users, cancel_event, credentials=credentials)
     if kind == "change":
         from . import changes
-        return changes.execute(task, allowed_users, cancel_event, output_dir)
+        return changes.execute(task, allowed_users, cancel_event, output_dir,
+                               credentials=credentials, controller=controller)
     return failure(task, "UNSUPPORTED_KIND:" + str(kind)[:40])
 
 
@@ -372,6 +384,10 @@ class Worker:
         self.allowed_users = config["allowed_users"]
         self.journal = Path(config["journal_dir"])
         self.journal.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Credentials live next to the journal, owned by the service account,
+        # encrypted with a key that never leaves this host (§47.1).
+        from .credentials import Store
+        self.credentials = Store(config.get('credential_dir') or (self.journal.parent / 'credentials'))
         self.prefix = "/api/v1/agents/" + self.asset_id
         self.instance_id = str(uuid.uuid4())
         self.controllers = controllers_of(config)
@@ -612,7 +628,8 @@ class Worker:
         thread = threading.Thread(target=monitor, daemon=True)
         thread.start()
         try:
-            result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'])
+            result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'],
+                              credentials=self.credentials, controller=controller)
             entry.update(phase='result_ready', result=result)
             atomic_json(path, entry)
             self.send_result(controller, task, result)
@@ -625,7 +642,57 @@ class Worker:
         return True
 
 
+def credential_cli(argv):
+    """``cred`` subcommands. These run on the managed host, by its owner.
+
+    This is where the managed machine exercises its veto (§46.2): it can list
+    what is stored, reveal a value locally, decide per control plane whether the
+    plaintext may leave, and destroy it. None of it requires the control plane to
+    be reachable, which is the point.
+    """
+    from .credentials import CredentialError, Store
+    parser = argparse.ArgumentParser(prog='ai-ops-agent cred')
+    sub = parser.add_subparsers(dest='action', required=True)
+    for name in ('list', 'share', 'unshare', 'revoke', 'destroy'):
+        one = sub.add_parser(name)
+        one.add_argument('--config', required=True)
+        if name in ('share', 'unshare', 'revoke'):
+            one.add_argument('--controller')
+        if name in ('share', 'unshare', 'destroy'):
+            one.add_argument('--id')
+    reveal = sub.add_parser('reveal')
+    reveal.add_argument('--config', required=True)
+    reveal.add_argument('--id', required=True)
+    args = parser.parse_args(argv)
+    config = read_config(args.config)
+    store = Store(config.get('credential_dir') or (Path(config['journal_dir']).parent / 'credentials'))
+    try:
+        if args.action == 'list':
+            print(json.dumps({'owner': store.master_id(), 'credentials': store.listing()},
+                             ensure_ascii=False, indent=2))
+        elif args.action == 'reveal':
+            # Deliberately stdout and local-only: this is the operator looking at
+            # their own machine, not a model.
+            print(store.reveal(args.id))
+        elif args.action == 'share':
+            print(json.dumps(store.share(args.id, args.controller, True), ensure_ascii=False))
+        elif args.action == 'unshare':
+            print(json.dumps(store.share(args.id, args.controller, False), ensure_ascii=False))
+        elif args.action == 'revoke':
+            store.revoke_controller(args.controller)
+            print('revoked ' + args.controller)
+        elif args.action == 'destroy':
+            store.destroy(args.id)
+            print('destroyed ' + args.id)
+    except CredentialError as error:
+        print('error: ' + error.code, file=sys.stderr)
+        return 2
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'cred':
+        raise SystemExit(credential_cli(sys.argv[2:]))
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--once", action="store_true")

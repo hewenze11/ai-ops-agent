@@ -134,7 +134,7 @@ def redact(text, literals=()):
     return text
 
 
-def execute(task, allowed_users, cancel_event=None):
+def execute(task, allowed_users, cancel_event=None, credentials=None):
     """Run one readonly task. Returns a result dict shaped like execute()."""
     claim_id = task.get('claim_id')
     run_as = task.get('run_as')
@@ -176,7 +176,12 @@ def execute(task, allowed_users, cancel_event=None):
     out = proc.stdout[:limit].decode('utf-8', 'replace')
     err = proc.stderr[:limit].decode('utf-8', 'replace')
     truncated = len(proc.stdout) > limit or len(proc.stderr) > limit
-    literals = task.get('_credential_literals') or ()
+    # Exact-match masking of known credential values first (§42.1 item 2): a
+    # pattern can miss a value that is shaped like nothing in particular, but a
+    # value we already hold cannot be missed. The literals never leave this host
+    # — the control plane only ever sends handles (§47).
+    literals = list(credentials.literals()) if credentials is not None else []
+    literals.extend(task.get('_credential_literals') or [])
     return {'claim_id': claim_id, 'status': 'succeeded' if proc.returncode == 0 else 'failed',
             'exit_code': proc.returncode,
             # Readonly output is masked at the source: it is a whole file body.
