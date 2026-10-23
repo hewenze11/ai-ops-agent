@@ -17,7 +17,12 @@ AGENT_VERSION = "0.1.0.dev4"
 OUTPUT_LIMIT = 65536
 # Task kinds this build understands. A task with any other kind is refused
 # rather than being run down a guessed path (fail closed, docs/protocol-v13.md).
-KINDS = ("shell", "readonly", "change")
+KINDS = ("shell", "readonly", "change", "reveal")
+# How many tasks this host will run at once. Not a model-facing knob (§52.3):
+# concurrency is a property of the machine, and the model cannot see the
+# machine. A control plane's own work is never blocked by itself; this is only
+# the ceiling on total parallelism.
+DEFAULT_MAX_CONCURRENT = 4
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -413,10 +418,17 @@ class Worker:
         # Short bookkeeping lock only: a slow controller never blocks another.
         self._heartbeat_lock = threading.Lock()
         self._heartbeat_state = {c['name']: {'seq': 0, 'results': {}, 'telemetry': True} for c in self.controllers}
-        # Execution-level mutex shared across ALL controllers: at any moment this
-        # agent runs at most one command, so it reports one busy owner.
-        self.busy_by = None
-        self.busy_task = None
+        # Execution-level bookkeeping: which controller currently owns a slot,
+        # and what each is running. Multiple slots exist (§52: one controller's
+        # work must not block itself), but a controller only ever occupies one:
+        # the same control plane's tasks still run one at a time on this host.
+        self._slots_lock = threading.Lock()
+        self._active = {}          # task_id -> controller name
+        # Controllers whose work has been claimed but not yet finished, in the
+        # order they were first seen. This is what "N controllers waiting in
+        # front of you" reports, and what enforces one-controller-at-a-time.
+        self._queue_order = []
+        self.max_concurrent = max(1, int(config.get('max_concurrent_tasks') or DEFAULT_MAX_CONCURRENT))
 
     def _default_controller(self):
         for controller in self.controllers:
@@ -427,11 +439,21 @@ class Worker:
     def heartbeat(self, controller=None):
         if controller is None:
             controller = self._default_controller()
+        with self._slots_lock:
+            owner = self._active_controller()
+            queued = len(self._queue_order)
         body = {'instance_id': self.instance_id, 'agent_version': AGENT_VERSION,
-                'protocol_version': PROTOCOL, 'busy': self.busy_by is not None}
-        if self.busy_by is not None:
-            body['busy_by'] = self.busy_by
-            body['busy_task'] = self.busy_task
+                'protocol_version': PROTOCOL, 'busy': owner is not None}
+        if owner is not None:
+            body['busy_by'] = owner
+            body['busy_task'] = self._busy_task_of(owner)
+        # How many controllers are ahead of the caller. This is the datum a
+        # control plane needs to decide "wait, or tell the user now" (§52.3).
+        # Deliberately a count of *controllers*, not of free slots: slots are an
+        # implementation detail of this host, and a controller cannot act on a
+        # number it does not control.
+        body['waiting_controllers'] = queued
+        body['max_concurrent_tasks'] = self.max_concurrent
         name = controller['name']
         with self._heartbeat_lock:
             state = self._heartbeat_state[name]
@@ -577,20 +599,97 @@ class Worker:
             entry["phase"] = "acknowledged"
             atomic_json(path, entry)
 
-    def once(self):
-        """One pass over every enabled controller.
+    def _active_controller(self):
+        """Which controller owns this host right now (None when idle).
 
-        Returns True if at least one controller delivered work in this pass.
+        Caller must hold ``_slots_lock``. When work from several controllers is
+        somehow in flight, the one that arrived first is the owner: that is the
+        contract the control planes were built around.
+        """
+        for name in self._queue_order:
+            if name in self._active.values():
+                return name
+        return None
+
+    def _busy_task_of(self, controller_name):
+        for task_id, owner in self._active.items():
+            if owner == controller_name:
+                return task_id
+        return None
+
+    def _slot_available(self, controller_name):
+        """May this controller start another task right now?
+
+        Caller must hold ``_slots_lock``. Two rules, and the second is the one
+        that keeps the original contract:
+
+        1. There is a free slot (this host is not saturated).
+        2. No *other* controller owns this host. A controller is never blocked
+           by itself -- the same control plane's tasks queue at the control
+           plane, which knows why they were submitted and can reorder them.
+           But a second controller waits until the first one is completely
+           finished, because two control planes running work on one host at the
+           same time is the situation neither of them designed for.
+        """
+        if len(self._active) >= self.max_concurrent:
+            return False
+        owner = self._active_controller()
+        return owner is None or owner == controller_name
+
+    def _enter(self, controller_name):
+        with self._slots_lock:
+            if controller_name not in self._queue_order:
+                self._queue_order.append(controller_name)
+
+    def _exit(self, controller_name):
+        with self._slots_lock:
+            if controller_name not in self._active.values() and controller_name in self._queue_order:
+                self._queue_order.remove(controller_name)
+
+    def once(self):
+        """Claim and start work from at most one controller per pass.
+
+        Returns True if any work was started. Execution itself runs on its own
+        thread, so a long task no longer blocks the next claim -- which is what
+        makes one controller's batch able to overlap with itself (§52).
         """
         self.flush_pending()
         worked = False
         for controller in self.controllers:
             if controller["enabled"] is not True:
                 continue
+            with self._slots_lock:
+                if not self._slot_available(controller["name"]):
+                    continue
             if self._once(controller):
                 worked = True
-                break
+                if not self._more_from(controller["name"]):
+                    break
         return worked
+
+    def wait_idle(self, timeout=3600):
+        """Block until no task is running. For ``--once`` smoke runs.
+
+        Without this, a one-shot Agent would exit while a task was still
+        executing, leaving the control plane to time the task out and the host
+        with a stray process. Returns False on timeout so the caller can say so.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._slots_lock:
+                if not self._active:
+                    return True
+            time.sleep(0.2)
+        return False
+
+    def _more_from(self, controller_name):
+        """True when another task from this controller could start right now.
+
+        Keeps a batch draining from the same controller instead of round-robining
+        into a blocked one, without looping forever when the host is saturated.
+        """
+        with self._slots_lock:
+            return self._slot_available(controller_name)
 
     def _once(self, controller):
         try:
@@ -617,6 +716,21 @@ class Worker:
             return False
         entry = {"phase": "started", "task": task, "controller": controller["name"]}
         atomic_json(path, entry)
+        # Reserve the slot before the thread starts, so the claim loop cannot
+        # over-subscribe between "I checked" and "it is running".
+        with self._slots_lock:
+            if len(self._active) >= self.max_concurrent:
+                return False
+            self._active[task['id']] = controller["name"]
+            if controller['name'] not in self._queue_order:
+                self._queue_order.append(controller['name'])
+        runner = threading.Thread(target=self._run_task, args=(controller, task, entry, path),
+                                  daemon=True)
+        runner.start()
+        return True
+
+    def _run_task(self, controller, task, entry, path):
+        """Execute one claimed task and report it. Runs on its own thread."""
         stop, cancelled = threading.Event(), threading.Event()
 
         def control():
@@ -624,42 +738,44 @@ class Worker:
             if response.get('cancel_requested') is True:
                 cancelled.set()
 
-        # Check a queued cancellation before starting any native process.
-        control()
-        # Announce the busy owner BEFORE execution so every other controller
-        # sees it and queues its own work instead of racing.
-        self.busy_by, self.busy_task = controller["name"], task["id"]
-
-        def monitor():
-            while not stop.wait(2):
-                for other in self.controllers:
-                    if other["enabled"] is not True:
-                        continue
-                    try:
-                        self.heartbeat(other)
-                        if other is controller:
-                            control()
-                    except Exception:
-                        # Disconnection is NOT evidence that execution stopped.
-                        # Local timeout still applies; journal preserves the result.
-                        pass
-
-        thread = threading.Thread(target=monitor, daemon=True)
-        thread.start()
         try:
-            result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'],
-                              credentials=self.credentials, controller=controller,
-                              allow_root_readonly=getattr(self, 'allow_root_readonly', False))
-            entry.update(phase='result_ready', result=result)
-            atomic_json(path, entry)
-            self.send_result(controller, task, result)
-            entry['phase'] = 'acknowledged'
-            atomic_json(path, entry)
+            # Check a queued cancellation before starting any native process.
+            control()
+
+            def monitor():
+                while not stop.wait(2):
+                    for other in self.controllers:
+                        if other["enabled"] is not True:
+                            continue
+                        try:
+                            self.heartbeat(other)
+                            if other is controller:
+                                control()
+                        except Exception:
+                            # Disconnection is NOT evidence that execution stopped.
+                            # Local timeout still applies; journal preserves the result.
+                            pass
+
+            thread = threading.Thread(target=monitor, daemon=True)
+            thread.start()
+            try:
+                result = dispatch(task, self.allowed_users, cancelled, self.journal / task['id'],
+                                  credentials=self.credentials, controller=controller,
+                                  allow_root_readonly=getattr(self, 'allow_root_readonly', False))
+                entry.update(phase='result_ready', result=result)
+                atomic_json(path, entry)
+                self.send_result(controller, task, result)
+                entry['phase'] = 'acknowledged'
+                atomic_json(path, entry)
+            finally:
+                stop.set()
+                thread.join(timeout=7)
         finally:
-            stop.set()
-            thread.join(timeout=7)
-            self.busy_by, self.busy_task = None, None
-        return True
+            with self._slots_lock:
+                self._active.pop(task['id'], None)
+                if controller['name'] not in self._active.values():
+                    if controller['name'] in self._queue_order:
+                        self._queue_order.remove(controller['name'])
 
 
 def credential_cli(argv):
@@ -729,6 +845,9 @@ def main():
         try:
             worked = worker.once()
             if args.once:
+                # One-shot mode is for smoke tests: claim once, then wait for
+                # in-flight work so the process does not exit mid-task.
+                worker.wait_idle()
                 break
             if not worked:
                 time.sleep(3)
