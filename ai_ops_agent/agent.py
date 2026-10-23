@@ -214,6 +214,7 @@ def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credential
 
     - missing kind   -> "shell": tasks from a pre-1.3 control plane.
     - "readonly"     -> stdlib-only execve path, no shell, redacted output.
+    - "reveal"       -> the same read with masking off, operator-initiated only.
     - "change"       -> structured action set, argv rebuilt locally.
     - anything else  -> refused. Never fall back to shell: that would turn an
                         unknown future task type into an unvalidated command.
@@ -229,6 +230,13 @@ def dispatch(task, allowed_users, cancel_event=None, output_dir=None, credential
         from . import readonly
         return readonly.execute(task, allowed_users, cancel_event, credentials=credentials,
                                allow_root_readonly=allow_root_readonly)
+    if kind == "reveal":
+        # Operator-initiated re-read with masking off (§51.4). A separate kind
+        # rather than a flag on readonly: a flag would be settable by whoever
+        # builds the readonly payload, and the model builds those.
+        from . import reveal
+        return reveal.execute(task, allowed_users, cancel_event, credentials=credentials,
+                              allow_root_readonly=allow_root_readonly)
     if kind == "change":
         from . import changes
         return changes.execute(task, allowed_users, cancel_event, output_dir,
