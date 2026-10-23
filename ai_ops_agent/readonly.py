@@ -55,6 +55,108 @@ class Rejected(Exception):
 
 _READONLY_TOOLS = frozenset(WHITELIST)
 
+# --- second derivation of argv from params ---------------------------------
+# The control plane sends both ``params`` (what the model asked for) and
+# ``args`` (what the control plane expanded it to). Until now this module only
+# checked ``args`` against the whitelist, which meant the two sides agreed by
+# convention rather than by construction: a buggy or compromised control plane
+# could send params the model never asked for, or args that do not follow from
+# any params at all.
+#
+# Re-deriving here is the endpoint half of the same check ``connector_kinds``
+# does on the control plane. It is deliberately a *separate copy* rather than a
+# shared import: an endpoint that trusts code shipped by the thing it is
+# checking is not checking anything (§39.2).
+UNIT_RE = re.compile(r'^[A-Za-z0-9@._\\:-]{1,128}$')
+PATH_RE = re.compile(r'^/[^\x00\n\r]{0,1023}$')
+K8S_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.:/-]{0,127}$')
+
+
+def _norm_path(value):
+    """Lexical normalisation, mirroring the control plane's rule."""
+    if not isinstance(value, str) or not PATH_RE.match(value):
+        raise Rejected('PATH_INVALID')
+    parts = []
+    for piece in value.split('/'):
+        if piece in ('', '.'):
+            continue
+        if piece == '..':
+            if not parts:
+                raise Rejected('PATH_ESCAPES_ROOT')
+            parts.pop()
+        else:
+            parts.append(piece)
+    return '/' + '/'.join(parts)
+
+
+def _int_param(value, low, high, code):
+    if type(value) is not int or not low <= value <= high:
+        raise Rejected(code)
+    return value
+
+
+def derive_argv(tool, params):
+    """Rebuild the argv the control plane claims to have built, from params.
+
+    Returns None when this build does not know how to derive for ``tool``; the
+    caller then falls back to argv-only validation (fail-open on *this check
+    only*, still whitelisted). Unknown tools never reach here.
+    """
+    if not isinstance(params, dict):
+        raise Rejected('PARAMS_INVALID')
+    if tool == 'read_file':
+        return ['--number', '--', _norm_path(params.get('path') or '')]
+    if tool == 'list_dir':
+        long_form = bool(params.get('long'))
+        return (['-la', '--'] if long_form else ['-a', '--']) + [_norm_path(params.get('path') or '/')]
+    if tool == 'file_stat':
+        return ['--', _norm_path(params.get('path') or '')]
+    if tool == 'disk_usage':
+        # df does not take '--'; the normalised path never starts with '-'.
+        return ['-h', _norm_path(params.get('path') or '/')]
+    if tool == 'memory_info':
+        return ['-m']
+    if tool == 'process_list':
+        return ['-eo', 'pid,ppid,user,pcpu,pmem,etime,args']
+    if tool == 'service_status':
+        unit = str(params.get('unit') or '')
+        if not UNIT_RE.match(unit):
+            raise Rejected('UNIT_INVALID')
+        return ['--no-pager', '--full', 'status', unit]
+    if tool == 'journal_logs':
+        lines = _int_param(params.get('lines', 200), 1, 2000, 'LINES_INVALID')
+        argv = ['--no-pager', '-n', str(lines)]
+        unit = params.get('unit')
+        if unit is not None:
+            if not UNIT_RE.match(str(unit)):
+                raise Rejected('UNIT_INVALID')
+            argv += ['-u', str(unit)]
+        return argv + ['--output=short-iso']
+    if tool == 'k8s_get':
+        namespace = str(params.get('namespace') or 'default')
+        if not K8S_NAME_RE.match(namespace):
+            raise Rejected('NAMESPACE_INVALID')
+        kind = str(params.get('kind') or '')
+        if not K8S_NAME_RE.match(kind):
+            raise Rejected('KIND_INVALID')
+        argv = ['get', kind, '-n', namespace, '-o', 'wide']
+        name = params.get('name')
+        if name is not None:
+            if not K8S_NAME_RE.match(str(name)):
+                raise Rejected('NAME_INVALID')
+            argv.insert(2, str(name))
+        return argv
+    if tool == 'k8s_logs':
+        name = params.get('name')
+        if name is None or not K8S_NAME_RE.match(str(name)):
+            raise Rejected('NAME_INVALID')
+        namespace = str(params.get('namespace') or 'default')
+        if not K8S_NAME_RE.match(namespace):
+            raise Rejected('NAMESPACE_INVALID')
+        lines = _int_param(params.get('lines', 200), 1, 2000, 'LINES_INVALID')
+        return ['logs', str(name), '-n', namespace, '--tail', str(lines)]
+    return None
+
 
 def _real(path):
     try:
@@ -83,6 +185,14 @@ def validate(task):
         raise Rejected('PROGRAM_NOT_EXECUTABLE')
     if st.st_mode & 0o6000:
         raise Rejected('PROGRAM_SETID')  # never exec a setuid/setgid helper
+    # Cross-check: if the task carries params, the argv must be exactly what
+    # those params produce. This is what makes the two sides agree by
+    # construction instead of by convention. A control plane that sends args
+    # unrelated to the params the model chose fails here.
+    if task.get('params') is not None:
+        derived = derive_argv(tool, task.get('params'))
+        if derived is not None and derived != args:
+            raise Rejected('ARGV_NOT_DERIVED_FROM_PARAMS')
     if not isinstance(args, list) or not 1 <= len(args) <= 64:
         raise Rejected('ARGV_INVALID')
     for arg in args:

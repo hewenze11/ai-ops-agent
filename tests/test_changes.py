@@ -102,3 +102,30 @@ def test_change_set_size_is_bounded():
     task['steps'] = task['steps'] * 11
     with pytest.raises(changes.Rejected):
         changes.validate(task)
+
+
+def test_credential_injection_happens_after_the_hash_check():
+    """Order matters and is easy to break.
+
+    validate() hashes the *original* params, which contain the placeholder
+    ``cred:xxx``. Injection replaces that placeholder with the plaintext. If
+    injection ran first, the hash would be computed over a payload nobody
+    approved, and every credential-injecting change set would fail -- or, worse,
+    an implementation that "fixed" that by hashing after injection would let the
+    plaintext decide the hash.
+
+    So: validate() must be usable on the raw task, and the injected copy must
+    never be what gets hashed.
+    """
+    step = {'action': 'file.write', 'params': {'path': '/tmp/x', 'content': 'cred:abc'},
+            'program': '__builtin_write__', 'args': ['/tmp/x'], 'identity': None}
+    task = {'claim_id': 'c' * 24, 'asset_id': 'web1', 'run_as': 'nobody',
+            'execution_users': ['nobody'], 'steps': [step], 'timeout_seconds': 30}
+    task['approval'] = {'payload_sha256': changes.payload_hash('web1', 'nobody', [step])}
+    assert changes.validate(task) == [step]
+    # A payload whose hash was taken over the injected content must NOT validate
+    # against the placeholder-bearing step: the two are different bytes.
+    injected = dict(step, params={'path': '/tmp/x', 'content': 'real-secret-value'})
+    task['approval'] = {'payload_sha256': changes.payload_hash('web1', 'nobody', [injected])}
+    with pytest.raises(changes.Rejected, match='APPROVAL_HASH_MISMATCH'):
+        changes.validate(task)
