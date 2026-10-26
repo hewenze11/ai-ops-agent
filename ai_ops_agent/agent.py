@@ -141,6 +141,14 @@ def request(config, path, body, timeout=30):
         # stop retrying instead of wedging the worker.
         if error.code in (409, 410):
             raise ControlRejected(error.code, path)
+        # Any other 4xx is the control plane refusing this specific body: it
+        # will refuse it identically forever (a schema the service does not
+        # accept, a task that no longer exists, a claim that was superseded).
+        # Retrying is not "being patient", it is a loop that never advances and
+        # blocks every later claim on the asset — which is exactly what a 422
+        # on an unknown field did. Treat it as durable and settle the journal.
+        if 400 <= error.code < 500:
+            raise ControlRejected(error.code, path)
         raise
     if len(raw) > 2_000_000:
         raise ValueError("Oversized control response")
